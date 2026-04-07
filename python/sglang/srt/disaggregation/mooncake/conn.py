@@ -1186,6 +1186,9 @@ class MooncakeKVManager(CommonKVManager):
         target_rank_registration_info,
         chunked_dst_kv_indice,
         executor,
+        staging_strategy=None,    
+        queue=None,               
+        prefill_unique_rank=None, 
     ):
         """
         send target or draft
@@ -1209,7 +1212,7 @@ class MooncakeKVManager(CommonKVManager):
             self.attn_tp_size == target_rank_registration_info.dst_attn_tp_size
         ):
             if target_rank_registration_info.enable_hisparse:
-                return self.send_kvcache_hisparse(
+                ret =  self.send_kvcache_hisparse(
                     req.mooncake_session_id,
                     kv_chunk.prefill_kv_indices,
                     target_rank_registration_info.dst_kv_ptrs,
@@ -1218,7 +1221,7 @@ class MooncakeKVManager(CommonKVManager):
                     executor,
                 )
             else:
-                return self._send_kvcache_generic(
+                ret =  self._send_kvcache_generic(
                     is_mla_backend=is_mla_backend,
                     mooncake_session_id=req.mooncake_session_id,
                     src_data_ptrs=src_data_ptrs,
@@ -1228,6 +1231,7 @@ class MooncakeKVManager(CommonKVManager):
                     dst_data_indices=chunked_dst_kv_indice,
                     executor=executor,
                 )
+            return ret, False
         
         elif (
             self.enable_staging
@@ -1244,37 +1248,17 @@ class MooncakeKVManager(CommonKVManager):
                 queue,
                 prefill_unique_rank,
             )
-            if deferred:
-                staging_deferred = True
-                # Chunk re-enqueued; stop processing remaining reqs for this chunk
-                break
+            return ret, deferred
 
         else:
             if is_target:
                 num_kv_heads = self.kv_args.kv_head_num
             else:
                 num_kv_heads = self.kv_args.draft_kv_head_num
-            logger.warning(
-                "PD_SLICE_DISPATCH is_target=%s mooncake_session_id=%s "
-                "engine_rank=%s attn_tp_size=%s dst_tp_rank=%s dst_attn_tp_size=%s "
-                "num_kv_heads=%s total_kv_head_num_attr=%s total_kv_head_num_value=%s "
-                "kv_head_num=%s draft_kv_head_num=%s",
-                is_target,
-                req.mooncake_session_id,
-                self.kv_args.engine_rank,
-                self.attn_tp_size,
-                target_rank_registration_info.dst_tp_rank,
-                target_rank_registration_info.dst_attn_tp_size,
-                num_kv_heads,
-                hasattr(self.kv_args, "total_kv_head_num"),
-                getattr(self.kv_args, "total_kv_head_num", None),
-                getattr(self.kv_args, "kv_head_num", None),
-                getattr(self.kv_args, "draft_kv_head_num", None),
-            )
             logger.debug(
                 f"{is_target=} send_kvcache_slice {is_mla_backend=} {src_data_ptrs=} {dst_data_ptrs=} {prefill_indices=} {src_item_lens=}"
             )
-            return self.send_kvcache_slice(
+            ret = self.send_kvcache_slice(
                 req.mooncake_session_id,
                 prefill_indices,
                 src_data_ptrs,
@@ -1287,6 +1271,7 @@ class MooncakeKVManager(CommonKVManager):
                 num_kv_heads,
                 executor,
             )
+            return ret, False
 
     def transfer_worker(
         self,
@@ -1365,20 +1350,26 @@ class MooncakeKVManager(CommonKVManager):
 
                         # target
                         if target_rank_registration_info.is_send_target:
-                            ret = self._send_kv_cache(
+                            ret, target_deferred = self._send_kv_cache(
                                 is_target=True,
                                 req=req,
                                 kv_chunk=kv_chunk,
                                 target_rank_registration_info=target_rank_registration_info,
                                 chunked_dst_kv_indice=chunked_dst_kv_indice,
                                 executor=executor,
+                                staging_strategy=staging_strategy,
+                                queue=queue,
+                                prefill_unique_rank=prefill_unique_rank,
                             )
+                            if target_deferred:
+                                staging_deferred = True
+                                break
                             if ret != 0:
                                 logger.error("target send kv cache failed")
                                 is_send_fail = True
                         # draft
                         if has_draft_data:
-                            ret = self._send_kv_cache(
+                            ret, draft_deferred = self._send_kv_cache(
                                 is_target=False,
                                 req=req,
                                 kv_chunk=kv_chunk,
@@ -1390,6 +1381,7 @@ class MooncakeKVManager(CommonKVManager):
                                 logger.error("draft send kv cache failed")
                                 is_send_fail = True
 
+                        
                         if is_send_fail:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
