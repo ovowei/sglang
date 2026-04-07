@@ -616,6 +616,7 @@ class ChatCompletionRequest(BaseModel):
     separate_reasoning: bool = True
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
+    thinking: Optional[Dict] = None
 
     # SGLang multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -749,8 +750,36 @@ class ChatCompletionRequest(BaseModel):
         Convert request to sampling parameters.
         Priority: user value > model generation_config > OpenAI defaults
         """
+        
+        #is_think_mode = False if self.thinking and self.thinking.get("type") == "disabled" else True
+        is_think_mode = False if self.chat_template_kwargs and self.chat_template_kwargs.get("thinking", None)==False else True
+
+        if is_think_mode:
+            fixed_defaults = {
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "presence_penalty": 0.0,
+                "frequency_penalty": 0.0,
+                "n": 1,
+            }
+        else:
+            fixed_defaults = {
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "presence_penalty": 0.0,
+                "frequency_penalty": 0.0,
+                "n": 1,
+            }
+
+        #protected_params = ["temperature", "top_p", "presence_penalty", "frequency_penalty", "n"]
+        #for param in protected_params:
+        #    user_value = getattr(self, param)
+        #    if user_value is not None and user_value != fixed_defaults[param]:
+        #        raise ValueError(f"Parameter '{param}' cannot be overridden. Fixed value: {fixed_defaults[param]}")
 
         def get_param(param_name: str):
+            if param_name in fixed_defaults:
+                return fixed_defaults[param_name]
             value = getattr(self, param_name)
             if value is None:
                 return model_generation_config.get(

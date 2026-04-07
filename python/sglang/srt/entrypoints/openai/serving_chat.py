@@ -237,6 +237,40 @@ class OpenAIServingChat(OpenAIServingBase):
             if schema is None:
                 return "schema_ is required for json_schema response format request."
 
+        # 添加固定参数验证
+        #is_think_mode = False if request.thinking and request.thinking.get("type") == "disabled" else True
+        is_think_mode = False if request.chat_template_kwargs and request.chat_template_kwargs.get("thinking", None)==False else True
+        
+        if is_think_mode:
+            expected_params = {
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "presence_penalty": 0.0,
+                "frequency_penalty": 0.0,
+                "n": 1,
+            }
+        else:
+            expected_params = {
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "presence_penalty": 0.0,
+                "frequency_penalty": 0.0,
+                "n": 1,
+            }
+        #import os
+        #with open("/tmp/debug_sampling_params.log", "a") as f:
+        #    f.write(f"PID {os.getpid()}: request={request} is_think_mdoe={is_think_mode} expected_params={expected_params}\n")
+        #    f.flush()
+
+        # 检查用户是否尝试修改固定参数
+        for param, expected_value in expected_params.items():
+            #with open("/tmp/debug_sampling_params.log", "a") as f:
+            #    f.write(f"#### param:{param} expected_value:{expected_value}\n")
+            #    f.flush()
+            user_value = getattr(request, param)
+            if user_value is not None and abs(user_value - expected_value) >= 1e-3:
+                return f"Parameter '{param}' cannot be overridden. Expected: {expected_value}, Got: {user_value}"
+
         return None
 
     def _convert_to_internal_request(
@@ -392,6 +426,16 @@ class OpenAIServingChat(OpenAIServingBase):
         modalities = []
 
         template_content_format = self.template_manager.jinja_template_content_format
+
+        if request.thinking is not None:
+            # 如果 chat_template_kwargs 为 None，先初始化为空字典
+            if request.chat_template_kwargs is None:
+                request.chat_template_kwargs = {}
+
+            if request.thinking.get("type") == "disabled":
+                request.chat_template_kwargs["thinking"] = False
+            else:
+                request.chat_template_kwargs["thinking"] = True
 
         if self.use_dpsk_v32_encoding:
             thinking_mode = (
