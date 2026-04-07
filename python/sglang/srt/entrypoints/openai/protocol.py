@@ -426,6 +426,12 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_string(cls, v):
+        if isinstance(v, str):
+            return {"url": v}
+        return v
 
 class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
