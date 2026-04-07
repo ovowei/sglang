@@ -125,6 +125,9 @@ class KVArgsRegisterInfo:
     dst_tp_rank: int
     dst_attn_tp_size: int
     dst_kv_item_len: int
+    draft_kv_ptrs: list[int]
+    draft_dst_kv_item_len: int
+    is_send_target: bool
     # for mamba state different tp slice transfer
     dst_state_item_lens: list[int]
     dst_state_dim_per_tensor: list[int]
@@ -146,21 +149,24 @@ class KVArgsRegisterInfo:
             dst_tp_rank=int(msg[7].decode("ascii")),
             dst_attn_tp_size=int(msg[8].decode("ascii")),
             dst_kv_item_len=int(msg[9].decode("ascii")),
+            draft_kv_ptrs=list(struct.unpack(f"{len(msg[10])//8}Q", msg[10])),
+            draft_dst_kv_item_len=int(msg[11].decode("ascii")),
+            is_send_target=bool(int(msg[12].decode("ascii"))),
             dst_state_item_lens=(
-                list(struct.unpack(f"{len(msg[10])//4}I", msg[10]))
-                if len(msg) > 10 and len(msg[10]) > 0
+                list(struct.unpack(f"{len(msg[13])//4}I", msg[13]))
+                if len(msg) > 10 and len(msg[13]) > 0
                 else []
             ),
             dst_state_dim_per_tensor=(
-                list(struct.unpack(f"{len(msg[11])//4}I", msg[11]))
-                if len(msg) > 11 and len(msg[11]) > 0
+                list(struct.unpack(f"{len(msg[14])//4}I", msg[14]))
+                if len(msg) > 11 and len(msg[14]) > 0
                 else []
             ),
             enable_hisparse=(
-                msg[12].decode("ascii") == "1" if len(msg) > 12 else False
+                msg[15].decode("ascii") == "1" if len(msg) > 15 else False
             ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 13),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 16),
         )
 
 
@@ -193,8 +199,11 @@ class MooncakeKVManager(CommonKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        is_draft_mla_backend: Optional[bool] = False,
     ):
-        super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        super().__init__(
+            args, disaggregation_mode, server_args, is_mla_backend, is_draft_mla_backend
+        )
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -262,6 +271,20 @@ class MooncakeKVManager(CommonKVManager):
         if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
             self.engine.batch_register(
                 self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
+            )
+            logger.debug(
+                f"register_buffer_to_engine {self.kv_args.kv_data_ptrs=} {self.kv_args.kv_data_lens=} {self.kv_args.kv_item_lens=}"
+            )
+
+        if (
+            len(self.kv_args.draft_kv_data_ptrs) > 0
+            and len(self.kv_args.draft_kv_data_lens) > 0
+        ):
+            self.engine.batch_register(
+                self.kv_args.draft_kv_data_ptrs, self.kv_args.draft_kv_data_lens
+            )
+            logger.debug(
+                f"register_buffer_to_engine {self.kv_args.draft_kv_data_ptrs=} {self.kv_args.draft_kv_data_lens=} {self.kv_args.draft_kv_item_lens=}"
             )
 
         # Batch register auxiliary data buffers
@@ -578,6 +601,7 @@ class MooncakeKVManager(CommonKVManager):
 
     def _send_kvcache_generic(
         self,
+        is_mla_backend: bool,
         mooncake_session_id: str,
         src_data_ptrs: list[int],
         dst_data_ptrs: list[int],
@@ -597,8 +621,8 @@ class MooncakeKVManager(CommonKVManager):
 
         layers_params = None
 
-        # Decode pp size should be equal to prefill pp size or 1
-        if self.is_mla_backend:
+        # pp is not supported on the decode side yet
+        if is_mla_backend:
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
                 self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
@@ -686,6 +710,7 @@ class MooncakeKVManager(CommonKVManager):
 
     def send_kvcache(
         self,
+        is_mla_backend: bool,
         mooncake_session_id: str,
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_ptrs: list[int],
@@ -693,6 +718,7 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
     ):
         return self._send_kvcache_generic(
+            is_mla_backend=is_mla_backend,
             mooncake_session_id=mooncake_session_id,
             src_data_ptrs=self.kv_args.kv_data_ptrs,
             dst_data_ptrs=dst_kv_ptrs,
@@ -748,12 +774,15 @@ class MooncakeKVManager(CommonKVManager):
     def send_kvcache_slice(
         self,
         mooncake_session_id: str,
-        prefill_kv_indices: npt.NDArray[np.int32],
+        prefill_kv_indices: npt.NDArray[np.int64],
+        src_kv_ptrs: list[int],
+        src_kv_item_len: int,
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
+        num_kv_heads: int,
         executor: concurrent.futures.ThreadPoolExecutor,
     ):
         """
@@ -766,7 +795,6 @@ class MooncakeKVManager(CommonKVManager):
         """
         # Extract configuration
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
-        src_kv_item_len = self.kv_args.kv_item_lens[0]
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
         page_size = self.kv_args.page_size
 
@@ -774,7 +802,7 @@ class MooncakeKVManager(CommonKVManager):
         # Per-rank kv_head_num is max(1, total//tp) which loses info when total < tp.
         total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
         if total_kv_heads <= 0:
-            total_kv_heads = self.kv_args.kv_head_num * self.attn_tp_size
+            total_kv_heads = num_kv_heads * self.attn_tp_size
 
         src_heads_per_rank = max(1, total_kv_heads // self.attn_tp_size)
         dst_heads_per_rank = max(1, total_kv_heads // dst_attn_tp_size)
@@ -803,7 +831,7 @@ class MooncakeKVManager(CommonKVManager):
             dst_head_start_offset = 0
 
         src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+            self.get_mha_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs)
         )
 
         # Calculate precise byte offset and length for the sub-slice within the token
@@ -845,6 +873,9 @@ class MooncakeKVManager(CommonKVManager):
             dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
             total_slices = len(src_addr_list)
             length_list = [heads_bytes_per_token_to_send] * total_slices
+            logger.debug(
+                f"process_layer_tp_aware {src_addr_list=} {dst_addr_list=} {length_list=}"
+            )
             return self.engine.batch_transfer_sync(
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
@@ -993,6 +1024,9 @@ class MooncakeKVManager(CommonKVManager):
                     dst_state_data_ptrs,
                 )
         elif state_type in ["swa", "nsa"]:
+            logger.debug(
+                f"maybe_send_extra swa/nsa {prefill_state_indices=} {dst_state_data_ptrs=} "
+            )
             # SWA and NSA hybrid models do not support different TP sizes yet
             if (
                 target_rank_registration_info is not None
@@ -1013,6 +1047,7 @@ class MooncakeKVManager(CommonKVManager):
             prefill_state_indices = np.array(prefill_state_indices, dtype=np.int32)
             dst_state_indices = np.array(req.dst_state_indices, dtype=np.int32)
             return self._send_kvcache_generic(
+                is_mla_backend=self.is_mla_backend,
                 mooncake_session_id=req.mooncake_session_id,
                 src_data_ptrs=self.kv_args.state_data_ptrs,
                 dst_data_ptrs=dst_state_data_ptrs,
@@ -1143,6 +1178,116 @@ class MooncakeKVManager(CommonKVManager):
             ]
         )
 
+    def _send_kv_cache(
+        self,
+        is_target: bool,
+        req,
+        kv_chunk,
+        target_rank_registration_info,
+        chunked_dst_kv_indice,
+        executor,
+    ):
+        """
+        send target or draft
+        """
+        if is_target:
+            src_data_ptrs = self.kv_args.kv_data_ptrs
+            dst_data_ptrs = target_rank_registration_info.dst_kv_ptrs
+            src_item_lens = self.kv_args.kv_item_lens
+            dst_kv_item_len = target_rank_registration_info.dst_kv_item_len
+            is_mla_backend = self.is_mla_backend
+            prefill_indices = kv_chunk.prefill_kv_indices
+        else:
+            src_data_ptrs = self.kv_args.draft_kv_data_ptrs
+            dst_data_ptrs = target_rank_registration_info.draft_kv_ptrs
+            src_item_lens = self.kv_args.draft_kv_item_lens
+            dst_kv_item_len = target_rank_registration_info.draft_dst_kv_item_len
+            is_mla_backend = self.is_draft_mla_backend
+            prefill_indices = kv_chunk.prefill_kv_indices
+
+        if is_mla_backend or (
+            self.attn_tp_size == target_rank_registration_info.dst_attn_tp_size
+        ):
+            if target_rank_registration_info.enable_hisparse:
+                return self.send_kvcache_hisparse(
+                    req.mooncake_session_id,
+                    kv_chunk.prefill_kv_indices,
+                    target_rank_registration_info.dst_kv_ptrs,
+                    req.dst_kv_indices,
+                    kv_chunk.index_slice,
+                    executor,
+                )
+            else:
+                return self._send_kvcache_generic(
+                    is_mla_backend=is_mla_backend,
+                    mooncake_session_id=req.mooncake_session_id,
+                    src_data_ptrs=src_data_ptrs,
+                    dst_data_ptrs=dst_data_ptrs,
+                    item_lens=src_item_lens,
+                    prefill_data_indices=prefill_indices,
+                    dst_data_indices=chunked_dst_kv_indice,
+                    executor=executor,
+                )
+        
+        elif (
+            self.enable_staging
+            and staging_strategy is not None
+            and target_rank_registration_info.staging is not None
+        ):
+            ret, deferred = self._do_staging_transfer(
+                staging_strategy,
+                kv_chunk,
+                req,
+                target_rank_registration_info,
+                chunked_dst_kv_indice,
+                executor,
+                queue,
+                prefill_unique_rank,
+            )
+            if deferred:
+                staging_deferred = True
+                # Chunk re-enqueued; stop processing remaining reqs for this chunk
+                break
+
+        else:
+            if is_target:
+                num_kv_heads = self.kv_args.kv_head_num
+            else:
+                num_kv_heads = self.kv_args.draft_kv_head_num
+            logger.warning(
+                "PD_SLICE_DISPATCH is_target=%s mooncake_session_id=%s "
+                "engine_rank=%s attn_tp_size=%s dst_tp_rank=%s dst_attn_tp_size=%s "
+                "num_kv_heads=%s total_kv_head_num_attr=%s total_kv_head_num_value=%s "
+                "kv_head_num=%s draft_kv_head_num=%s",
+                is_target,
+                req.mooncake_session_id,
+                self.kv_args.engine_rank,
+                self.attn_tp_size,
+                target_rank_registration_info.dst_tp_rank,
+                target_rank_registration_info.dst_attn_tp_size,
+                num_kv_heads,
+                hasattr(self.kv_args, "total_kv_head_num"),
+                getattr(self.kv_args, "total_kv_head_num", None),
+                getattr(self.kv_args, "kv_head_num", None),
+                getattr(self.kv_args, "draft_kv_head_num", None),
+            )
+            logger.debug(
+                f"{is_target=} send_kvcache_slice {is_mla_backend=} {src_data_ptrs=} {dst_data_ptrs=} {prefill_indices=} {src_item_lens=}"
+            )
+            return self.send_kvcache_slice(
+                req.mooncake_session_id,
+                prefill_indices,
+                src_data_ptrs,
+                src_item_lens[0],
+                dst_data_ptrs,
+                chunked_dst_kv_indice,
+                target_rank_registration_info.dst_tp_rank,
+                target_rank_registration_info.dst_attn_tp_size,
+                dst_kv_item_len,
+                num_kv_heads,
+                executor,
+            )
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -1212,58 +1357,40 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
-                        if self.is_mla_backend or (
-                            self.attn_tp_size
-                            == target_rank_registration_info.dst_attn_tp_size
-                        ):
-                            if target_rank_registration_info.enable_hisparse:
-                                ret = self.send_kvcache_hisparse(
-                                    req.mooncake_session_id,
-                                    kv_chunk.prefill_kv_indices,
-                                    target_rank_registration_info.dst_kv_ptrs,
-                                    req.dst_kv_indices,
-                                    kv_chunk.index_slice,
-                                    executor,
-                                )
-                            else:
-                                ret = self.send_kvcache(
-                                    req.mooncake_session_id,
-                                    kv_chunk.prefill_kv_indices,
-                                    target_rank_registration_info.dst_kv_ptrs,
-                                    chunked_dst_kv_indice,
-                                    executor,
-                                )
-                        elif (
-                            self.enable_staging
-                            and staging_strategy is not None
-                            and target_rank_registration_info.staging is not None
-                        ):
-                            ret, deferred = self._do_staging_transfer(
-                                staging_strategy,
-                                kv_chunk,
-                                req,
-                                target_rank_registration_info,
-                                chunked_dst_kv_indice,
-                                executor,
-                                queue,
-                                prefill_unique_rank,
+
+
+                        # start send kv cache
+                        has_draft_data = len(self.kv_args.draft_kv_data_lens) > 0
+                        is_send_fail = False
+
+                        # target
+                        if target_rank_registration_info.is_send_target:
+                            ret = self._send_kv_cache(
+                                is_target=True,
+                                req=req,
+                                kv_chunk=kv_chunk,
+                                target_rank_registration_info=target_rank_registration_info,
+                                chunked_dst_kv_indice=chunked_dst_kv_indice,
+                                executor=executor,
                             )
-                            if deferred:
-                                staging_deferred = True
-                                # Chunk re-enqueued; stop processing remaining reqs for this chunk
-                                break
-                        else:
-                            ret = self.send_kvcache_slice(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                                target_rank_registration_info.dst_tp_rank,
-                                target_rank_registration_info.dst_attn_tp_size,
-                                target_rank_registration_info.dst_kv_item_len,
-                                executor,
+                            if ret != 0:
+                                logger.error("target send kv cache failed")
+                                is_send_fail = True
+                        # draft
+                        if has_draft_data:
+                            ret = self._send_kv_cache(
+                                is_target=False,
+                                req=req,
+                                kv_chunk=kv_chunk,
+                                target_rank_registration_info=target_rank_registration_info,
+                                chunked_dst_kv_indice=chunked_dst_kv_indice,
+                                executor=executor,
                             )
-                        if ret != 0:
+                            if ret != 0:
+                                logger.error("draft send kv cache failed")
+                                is_send_fail = True
+
+                        if is_send_fail:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
                                 # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
@@ -1289,13 +1416,29 @@ class MooncakeKVManager(CommonKVManager):
 
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices is not None:
-                                self.maybe_send_extra(
-                                    req,
-                                    kv_chunk.state_indices,
-                                    target_rank_registration_info.dst_state_data_ptrs,
-                                    executor,
-                                    target_rank_registration_info,
-                                )
+                                if not self.is_mla_backend and (
+                                    self.attn_tp_size
+                                    != target_rank_registration_info.dst_attn_tp_size
+                                ):
+                                    raise RuntimeError(
+                                        f"PD Disaggregation does NOT support PD different TP sizes for non-MLA hybrid models yet."
+                                    )
+
+                                state_type = getattr(self.kv_args, "state_type", "none")
+                                assert (
+                                    state_type != "nsa"
+                                    or target_rank_registration_info.is_send_target
+                                )  # nsa not suppot attn_tp > 1
+                                if (
+                                    state_type != "nsa"
+                                    or target_rank_registration_info.is_send_target
+                                ):  # only nsa care abort is_need_send_target flag
+                                    self.maybe_send_extra(
+                                        req,
+                                        kv_chunk.state_indices,
+                                        target_rank_registration_info.dst_state_data_ptrs,
+                                        executor,
+                                    )
 
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(
@@ -1789,6 +1932,19 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 packed_staging_base_ptr = b""
                 staging_total_size_str = b""
 
+            draft_packed_kv_data_ptrs = b""
+            draft_dst_kv_item_len = dst_kv_item_len
+            if len(self.kv_mgr.kv_args.draft_kv_data_ptrs) > 0:
+                draft_packed_kv_data_ptrs = b"".join(
+                    struct.pack("Q", ptr)
+                    for ptr in self.kv_mgr.kv_args.draft_kv_data_ptrs
+                )
+                draft_dst_kv_item_len = str(
+                    self.kv_mgr.kv_args.draft_kv_item_lens[0]
+                ).encode("ascii")
+            is_send_target = bootstrap_info["is_send_target"]
+            is_send_target_str = b"1" if is_send_target else b"0"
+
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             with lock:
                 sock.send_multipart(
@@ -1803,6 +1959,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         dst_tp_rank,
                         dst_attn_tp_size,
                         dst_kv_item_len,
+                        draft_packed_kv_data_ptrs,
+                        draft_dst_kv_item_len,
+                        is_send_target_str,
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
                         enable_hisparse,

@@ -109,6 +109,9 @@ class PrefillBootstrapQueue:
         self.token_to_kv_pool = token_to_kv_pool
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.is_mla_backend = is_mla_backend(token_to_kv_pool)
+        self.is_draft_mla_backend = False
+        if draft_token_to_kv_pool is not None:
+            self.is_draft_mla_backend = is_mla_backend(draft_token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
@@ -146,6 +149,9 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+        kv_args.kv_data_ptrs = kv_data_ptrs
+        kv_args.kv_data_lens = kv_data_lens
+        kv_args.kv_item_lens = kv_item_lens
 
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
@@ -153,18 +159,20 @@ class PrefillBootstrapQueue:
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
-
-        kv_args.kv_data_ptrs = kv_data_ptrs
-        kv_args.kv_data_lens = kv_data_lens
-        kv_args.kv_item_lens = kv_item_lens
+            kv_args.draft_kv_data_ptrs = draft_kv_data_ptrs
+            kv_args.draft_kv_data_lens = draft_kv_data_lens
+            kv_args.draft_kv_item_lens = draft_kv_item_lens
+        else:
+            kv_args.draft_kv_data_ptrs = []
+            kv_args.draft_kv_data_lens = []
+            kv_args.draft_kv_item_lens = []
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (
                 self.scheduler.model_config.get_total_num_kv_heads()
             )
+        if self.draft_token_to_kv_pool is not None and not self.is_draft_mla_backend:
+            kv_args.draft_kv_head_num = self.draft_token_to_kv_pool.head_num
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
@@ -206,6 +214,7 @@ class PrefillBootstrapQueue:
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
             self.is_mla_backend,
+            self.is_draft_mla_backend,
         )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
