@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 
 
 class MooncakeHostTensorAllocator(HostTensorAllocator):
+    supports_cuda_batch_memcpy = False
+
     def __init__(self):
         super().__init__()
         from mooncake.store import MooncakeHostMemAllocator

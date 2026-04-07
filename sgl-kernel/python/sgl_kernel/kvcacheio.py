@@ -199,9 +199,10 @@ def transfer_kv_per_layer_direct_pf_lf(
     dst_indices: torch.Tensor,
     layer_id: int,
     page_size: int,
+    use_batch_memcpy: bool = True,
 ):
     torch.ops.sgl_kernel.transfer_kv_per_layer_direct_pf_lf.default(
-        src_ptrs, dst_ptrs, src_indices, dst_indices, layer_id, page_size
+        src_ptrs, dst_ptrs, src_indices, dst_indices, layer_id, page_size, use_batch_memcpy
     )
 
 
@@ -211,9 +212,10 @@ def transfer_kv_all_layer_direct_lf_pf(
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
     page_size: int,
+    use_batch_memcpy: bool = True,
 ):
     torch.ops.sgl_kernel.transfer_kv_all_layer_direct_lf_pf.default(
-        src_ptrs, dst_ptrs, src_indices, dst_indices, page_size
+        src_ptrs, dst_ptrs, src_indices, dst_indices, page_size, use_batch_memcpy
     )
 
 
