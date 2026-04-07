@@ -758,6 +758,30 @@ def load_audio(
     return audio
 
 
+
+def _download_url_with_total_timeout(url: str, default_timeout: str = "3") -> bytes:
+    """Download URL content with both socket timeout and wall-clock timeout."""
+    request_timeout = float(os.getenv("REQUEST_TIMEOUT", default_timeout))
+    total_timeout = float(os.getenv("REQUEST_TOTAL_TIMEOUT", "10"))
+    start_time = time.monotonic()
+    buffer = BytesIO()
+
+    try:
+        with requests.get(url, stream=True, timeout=request_timeout) as response:
+            response.raise_for_status()
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    buffer.write(chunk)
+                if time.monotonic() - start_time > total_timeout:
+                    raise TimeoutError(
+                        f"Image download exceeded total timeout ({total_timeout}s): {url}"
+                    )
+        return buffer.getvalue()
+    except Exception as e:
+        raise RuntimeError(f"Failed to download image from URL: {url}") from e
+    finally:
+        buffer.close()
+
 @dataclass
 class ImageData:
     url: str
@@ -851,14 +875,7 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     if isinstance(image_file, bytes):
         return image_file
     if image_file.startswith(("http://", "https://")):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, timeout=timeout)
-        try:
-            response.raise_for_status()
-            result = response.content
-        finally:
-            response.close()
-        return result
+        return _download_url_with_total_timeout(image_file)
     if image_file.startswith(("file://", "/")):
         with open(image_file, "rb") as f:
             return f.read()

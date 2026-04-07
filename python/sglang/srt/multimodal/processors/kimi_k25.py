@@ -1,3 +1,7 @@
+import asyncio
+import os
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 import re
 from typing import Dict, List, Tuple, Union
 
@@ -29,6 +33,14 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
             image_token_id=hf_config.media_placeholder_token_id,
             image_token_regex=re.compile(r"(?:<\|media_pad\|>)+"),
         ).build(_processor)
+        self.mm_async_executor = ThreadPoolExecutor(
+            max_workers=int(
+                os.environ.get(
+                    "SGLANG_MM_ASYNC_WORKERS",
+                    os.environ.get("SGLANG_IO_WORKERS", 4),
+                )
+            )
+        )
 
     async def process_mm_data_async(
         self,
@@ -38,15 +50,24 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        base_output = self.load_mm_data(
-            prompt=input_text,
-            image_data=image_data,
-            multimodal_tokens=self.mm_tokens,
+        loop = asyncio.get_running_loop()
+        # Use a dedicated async-MM executor here:
+        # - avoid event-loop default executor contention with other subsystems;
+        # - avoid self-deadlock risk from nesting on self.io_executor.
+        base_output = await loop.run_in_executor(
+            self.mm_async_executor,
+            partial(
+                self.load_mm_data,
+                prompt=input_text,
+                image_data=image_data,
+                multimodal_tokens=self.mm_tokens,
+            ),
         )
         prompt = base_output.input_text
 
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
+        mm_items, input_ids, _ = await loop.run_in_executor(
+            self.mm_async_executor,
+            partial(self.process_and_combine_mm_data, base_output, self.mm_tokens),
         )
 
         return MultimodalProcessorOutput(
