@@ -172,11 +172,14 @@ class RequestLogger:
             return
 
         max_length, skip_names, out_skip_names = self.metadata
+        input_ids = getattr(obj, "input_ids", None)
+        input_ids_len = len(input_ids) if input_ids is not None else 0
         headers = _extract_whitelisted_headers(request)
         if self.log_requests_format == "json":
             log_data = {
                 "rid": obj.rid,
                 "obj": _transform_data_for_logging(obj, max_length, skip_names),
+                "input_ids_len": input_ids_len,
             }
             if headers:
                 log_data["headers"] = headers
@@ -190,7 +193,7 @@ class RequestLogger:
             )
             out_str = f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
             headers_str = f", headers={headers}" if headers else ""
-            self._log(f"Finish: obj={obj_str}{headers_str}{out_str}")
+            self._log(f"Finish: input_ids_len={input_ids_len}, obj={obj_str}{headers_str}{out_str}")
 
     def _compute_metadata(
         self,
@@ -203,14 +206,14 @@ class RequestLogger:
                 max_length = 1 << 30
                 skip_names = {
                     "text",
-                    "input_ids",
+                   # "input_ids",
                     "input_embeds",
                     "image_data",
                     "audio_data",
                     "lora_path",
                     "sampling_params",
                 }
-                out_skip_names = {"text", "output_ids", "embedding"}
+                out_skip_names = {"text", "embedding"}
             elif self.log_requests_level == 1:
                 max_length = 1 << 30
                 skip_names = {

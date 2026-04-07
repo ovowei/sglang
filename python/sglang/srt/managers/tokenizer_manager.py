@@ -547,6 +547,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
+                if obj.input_ids is None:
+                    obj.input_ids = tokenized_obj.input_ids
                 state = self.rid_to_state[obj.rid]
                 self._send_one_request(tokenized_obj)
                 async for response in self._wait_one_response(obj, state, request):
@@ -1310,6 +1312,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 # Set up generators for each request in the batch
                 for i in range(batch_size):
                     tmp_obj = obj[i]
+                    if tmp_obj.input_ids is None:
+                        tmp_obj.input_ids = tokenized_objs[i].input_ids
                     state = self.rid_to_state[tmp_obj.rid]
                     state.obj = tmp_obj
                     generators.append(self._wait_one_response(tmp_obj, state, request))
@@ -1324,6 +1328,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     for i in range(batch_size):
                         tmp_obj = obj[i]
                         tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                        if tmp_obj.input_ids is None:
+                            tmp_obj.input_ids = tokenized_obj.input_ids
                         state = self.rid_to_state[tmp_obj.rid]
                         state.obj = tmp_obj
                         self._send_one_request(tokenized_obj)
@@ -1345,6 +1351,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             tokenized_objs = await asyncio.gather(
                 *(self._tokenize_one_request(obj) for obj in objs)
             )
+            for i in range(batch_size):
+                if objs[i].input_ids is None:
+                    objs[i].input_ids = tokenized_objs[i].input_ids
 
             # Cache the common prefix for parallel sampling
             for i in range(batch_size):
@@ -1693,7 +1702,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 )
                 state.time_stats.set_finished_time()
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
-
+                meta_info["ttft"] = state.time_stats.get_first_token_latency()
                 if self.server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
                 if self.enable_metrics:
