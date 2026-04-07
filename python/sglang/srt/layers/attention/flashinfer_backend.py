@@ -1091,7 +1091,13 @@ class FlashInferIndicesUpdaterDecode:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
-        if spec_info is None:
+        use_spec_kv = (
+            spec_info is not None
+            and spec_info.kv_indptr is not None
+            and spec_info.kv_indices is not None
+        )
+
+        if not use_spec_kv:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
