@@ -562,7 +562,7 @@ class ChatCompletionRequest(BaseModel):
     logprobs: bool = False
     top_logprobs: Optional[int] = None
     max_tokens: Optional[int] = Field(
-        default=None,
+        default=32768,
         deprecated="max_tokens is deprecated in favor of the max_completion_tokens field",
         description="The maximum number of tokens that can be generated in the chat completion. ",
     )
