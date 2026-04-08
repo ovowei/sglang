@@ -5,6 +5,8 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from torch import nn
 from transformers import activations
 
@@ -48,6 +50,138 @@ logger = logging.getLogger(__name__)
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 
 _is_npu = is_npu()
+
+
+@triton.jit
+def _kimi_k25_cubic_weight(distance):
+    abs_distance = tl.abs(distance)
+    abs_distance2 = abs_distance * abs_distance
+    abs_distance3 = abs_distance2 * abs_distance
+    a = -0.75
+    inner = (a + 2.0) * abs_distance3 - (a + 3.0) * abs_distance2 + 1.0
+    outer = a * abs_distance3 - 5.0 * a * abs_distance2 + 8.0 * a * abs_distance - 4.0 * a
+    return tl.where(abs_distance <= 1.0, inner, tl.where(abs_distance < 2.0, outer, 0.0))
+
+
+@triton.jit
+def _kimi_k25_pos_emb_bicubic_kernel(
+    out_ptr,
+    x_ptr,
+    weight_ptr,
+    time_weight_ptr,
+    item_offsets_ptr,
+    item_ts_ptr,
+    item_hs_ptr,
+    item_ws_ptr,
+    src_h: tl.constexpr,
+    src_w: tl.constexpr,
+    dim: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    item_id = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
+    pid_d = tl.program_id(axis=2)
+
+    item_offset = tl.load(item_offsets_ptr + item_id)
+    item_t = tl.load(item_ts_ptr + item_id)
+    item_h = tl.load(item_hs_ptr + item_id)
+    item_w = tl.load(item_ws_ptr + item_id)
+
+    item_hw = item_h * item_w
+    item_tokens = item_t * item_hw
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = (offs_m[:, None] < item_tokens) & (offs_d[None, :] < dim)
+
+    token_offsets = item_offset + offs_m
+    x_offsets = token_offsets[:, None] * dim + offs_d[None, :]
+    x = tl.load(x_ptr + x_offsets, mask=mask, other=0.0).to(tl.float32)
+
+    frame_idx = offs_m // item_hw
+    spatial_idx = offs_m - frame_idx * item_hw
+    out_y = spatial_idx // item_w
+    out_x = spatial_idx - out_y * item_w
+
+    scale_y = tl.full((), src_h, tl.float32) / item_h.to(tl.float32)
+    scale_x = tl.full((), src_w, tl.float32) / item_w.to(tl.float32)
+    src_y = (out_y.to(tl.float32) + 0.5) * scale_y - 0.5
+    src_x = (out_x.to(tl.float32) + 0.5) * scale_x - 0.5
+    base_y = tl.floor(src_y).to(tl.int32) - 1
+    base_x = tl.floor(src_x).to(tl.int32) - 1
+
+    pos = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    for kernel_y in tl.static_range(4):
+        sample_y = base_y + kernel_y
+        clipped_y = tl.minimum(tl.maximum(sample_y, 0), src_h - 1)
+        weight_y = _kimi_k25_cubic_weight(src_y - sample_y.to(tl.float32))
+        for kernel_x in tl.static_range(4):
+            sample_x = base_x + kernel_x
+            clipped_x = tl.minimum(tl.maximum(sample_x, 0), src_w - 1)
+            weight_x = _kimi_k25_cubic_weight(src_x - sample_x.to(tl.float32))
+            sample_offsets = (
+                (clipped_y * src_w + clipped_x)[:, None] * dim + offs_d[None, :]
+            )
+            sample = tl.load(
+                weight_ptr + sample_offsets,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+            pos += sample * (weight_y * weight_x)[:, None]
+
+    add_time = (item_t > 1).to(tl.float32)
+    time_offsets = frame_idx[:, None] * dim + offs_d[None, :]
+    time_pos = tl.load(time_weight_ptr + time_offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    pos += time_pos * add_time
+
+    tl.store(out_ptr + x_offsets, x + pos, mask=mask)
+
+
+def kimi_k25_pos_emb_triton_forward(
+    x: torch.Tensor,
+    grid_thws: torch.Tensor,
+    weight: torch.Tensor,
+    time_weight: torch.Tensor,
+) -> torch.Tensor:
+    assert x.is_cuda
+    assert grid_thws.is_cuda
+    assert weight.is_cuda
+    assert time_weight.is_cuda
+
+    item_meta = grid_thws.to(device=x.device, dtype=torch.int32)
+    item_tokens = item_meta.prod(dim=-1)
+    item_offsets = torch.zeros_like(item_tokens)
+    item_offsets[1:] = torch.cumsum(item_tokens, dim=0)[:-1]
+
+    block_m = 8
+    block_d = 64 if x.shape[-1] >= 64 else triton.next_power_of_2(x.shape[-1])
+    grid = (
+        item_meta.shape[0],
+        triton.cdiv(int(item_tokens.max().item()), block_m),
+        triton.cdiv(x.shape[-1], block_d),
+    )
+
+    out = torch.empty_like(x)
+    _kimi_k25_pos_emb_bicubic_kernel[grid](
+        out,
+        x,
+        weight.contiguous().view(-1, weight.shape[-1]),
+        time_weight.contiguous().view(time_weight.shape[0], -1),
+        item_offsets,
+        item_meta[:, 0].contiguous(),
+        item_meta[:, 1].contiguous(),
+        item_meta[:, 2].contiguous(),
+        src_h=weight.shape[0],
+        src_w=weight.shape[1],
+        dim=x.shape[-1],
+        BLOCK_M=block_m,
+        BLOCK_D=block_d,
+        num_warps=4,
+    )
+    return out
 
 
 def apply_rope(
@@ -208,7 +342,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
 
 @get_rope_shape_decorate
-# @torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=_is_npu)
 def get_rope_shape(org, interpolation_mode, shape):
     return (
         F.interpolate(
@@ -265,7 +399,7 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
     def reset_parameters(self):
         nn.init.normal_(self.weight)
 
-    def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
+    def forward_native(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
         pos_embs = []
         for t, h, w in grid_thws.tolist():
             assert t <= self.num_frames, f"t:{t} > self.num_frames:{self.num_frames}"
@@ -289,6 +423,25 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
 
         out = x + torch.cat(pos_embs)
         return out
+
+    def _use_triton_forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> bool:
+        return (
+            x.is_cuda
+            and grid_thws.is_cuda
+            and not _is_npu
+            and not torch.is_grad_enabled()
+            and self.interpolation_mode == "bicubic"
+        )
+
+    def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
+        if self._use_triton_forward(x, grid_thws):
+            return kimi_k25_pos_emb_triton_forward(
+                x=x,
+                grid_thws=grid_thws,
+                weight=self.weight,
+                time_weight=self.time_weight,
+            )
+        return self.forward_native(x, grid_thws)
 
 
 class Rope2DPosEmbRepeated(nn.Module):
