@@ -2102,6 +2102,10 @@ class Scheduler(
                 elif self.enable_hierarchical_cache:
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
+                # Release shm handles before aborting
+                if candidate_req.multimodal_inputs is not None and candidate_req.session is None:
+                    candidate_req.multimodal_inputs.release_features()
+                    candidate_req.multimodal_inputs = None
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
@@ -2128,6 +2132,10 @@ class Scheduler(
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
+                # Release shm handles before dropping the request
+                if req.multimodal_inputs is not None and req.session is None:
+                    req.multimodal_inputs.release_features()
+                    req.multimodal_inputs = None
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
@@ -3286,6 +3294,10 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            # Release shm handles before dropping the request
+            if req.multimodal_inputs is not None and req.session is None:
+                req.multimodal_inputs.release_features()
+                req.multimodal_inputs = None
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)

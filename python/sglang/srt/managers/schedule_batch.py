@@ -1297,6 +1297,10 @@ class Req(ReqDllmMixin):
     def set_finish_with_abort(self, error_msg: str):
         if get_tensor_model_parallel_rank() == 0:
             logger.error(f"{error_msg}, {self.rid=}")
+        # Release shm handles before dropping multimodal_inputs.
+        # Skip for session requests — their mm_inputs are shared across turns.
+        if self.multimodal_inputs is not None and self.session is None:
+            self.multimodal_inputs.release_features()
         self.multimodal_inputs = None
         self.grammar = None
         self.origin_input_ids = [0]  # set it to one token to skip the long prefill
