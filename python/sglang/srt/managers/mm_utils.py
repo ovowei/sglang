@@ -994,6 +994,29 @@ def _embed_mm_inputs_with_split(
     return input_embeds, other_info
 
 
+def _all_items_fully_processed(
+    mm_input_obj: "MultimodalInputs",
+    extend_prefix_len: int,
+    extend_seq_len: int,
+) -> bool:
+    """Check if all multimodal items have been fully processed in the current chunk.
+    Returns True if every item's offset range falls within [0, prefix_len + seq_len).
+    Offsets are (start, end) tuples with inclusive ends."""
+    chunk_end = extend_prefix_len + extend_seq_len
+    for item in mm_input_obj.mm_items:
+        if item.offsets is None:
+            continue
+        for offset in item.offsets:
+            if isinstance(offset, (list, tuple)) and len(offset) == 2:
+                _, end = offset
+                if end >= chunk_end:
+                    return False
+            else:
+                if offset >= chunk_end:
+                    return False
+    return True
+
+
 def general_mm_embed_routine(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -1071,34 +1094,45 @@ def general_mm_embed_routine(
             # add for qwen3_vl deepstack
             if use_deepstack:
                 kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
-            # Offload GPU features to CPU instead of discarding them to balance memory
-            # efficiency and data persistence.
-            # In chunked-prefill, a request is processed across multiple batches, and
-            # the original multimodal data must remain accessible until the entire
-            # prefill phase is complete. Since the multimodal embedding cache is
-            # best-effort, offloading to CPU ensures we have a reliable fallback
-            # if a cache miss occurs in subsequent chunks, while still freeing up
-            # critical GPU memory.
+            # Offload GPU features to CPU when needed for future chunks.
+            # Skip offload when chunked prefill is off or all items are
+            # fully processed in this chunk (no future chunk will need them).
             if mm_inputs_list:
-                for mm_input_obj in mm_inputs_list:
-                    if mm_input_obj and hasattr(mm_input_obj, "mm_items"):
-                        for mm_item in mm_input_obj.mm_items:
-                            feature = getattr(mm_item, "feature", None)
-                            if isinstance(feature, torch.Tensor) and feature.is_cuda:
+                chunked_prefill_enabled = (
+                    get_global_server_args().chunked_prefill_size != -1
+                )
+                for i, mm_input_obj in enumerate(mm_inputs_list):
+                    if not mm_input_obj or not hasattr(mm_input_obj, "mm_items"):
+                        continue
+
+                    need_feature_offload = chunked_prefill_enabled and not _all_items_fully_processed(
+                        mm_input_obj,
+                        extend_prefix_lens[i] if i < len(extend_prefix_lens) else 0,
+                        extend_seq_lens[i] if i < len(extend_seq_lens) else 0,
+                    )
+
+                    for mm_item in mm_input_obj.mm_items:
+                        feature = getattr(mm_item, "feature", None)
+                        if isinstance(feature, torch.Tensor) and feature.is_cuda:
+                            if need_feature_offload:
                                 mm_item.feature = feature.to("cpu", non_blocking=True)
-                            if get_global_server_args().language_only:
-                                precomputed_embeddings = getattr(
-                                    mm_item, "precomputed_embeddings", None
-                                )
-                                if (
-                                    isinstance(precomputed_embeddings, torch.Tensor)
-                                    and precomputed_embeddings.is_cuda
-                                ):
-                                    mm_item.precomputed_embeddings = (
-                                        precomputed_embeddings.to(
-                                            "cpu", non_blocking=True
-                                        )
+                            else:
+                                mm_item.feature = None
+
+                        # language_only precomputed_embeddings offload — unchanged
+                        if get_global_server_args().language_only:
+                            precomputed_embeddings = getattr(
+                                mm_item, "precomputed_embeddings", None
+                            )
+                            if (
+                                isinstance(precomputed_embeddings, torch.Tensor)
+                                and precomputed_embeddings.is_cuda
+                            ):
+                                mm_item.precomputed_embeddings = (
+                                    precomputed_embeddings.to(
+                                        "cpu", non_blocking=True
                                     )
+                                )
             forward_batch.mm_inputs = None
             forward_batch.mm_input_embeds = input_embeds
         else:
