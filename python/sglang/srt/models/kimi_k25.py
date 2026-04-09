@@ -434,6 +434,7 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
+        self.time_weight = self.time_weight.to(device=x.device)
         if self._use_triton_forward(x, grid_thws):
             return kimi_k25_pos_emb_triton_forward(
                 x=x,
