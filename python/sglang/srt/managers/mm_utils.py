@@ -1579,6 +1579,14 @@ class ShmPointerMMData:
             self._shm_handle = None
         return tensor
 
+    def expose(self):
+        """Return mmap-backed tensor view without cloning.
+        Transfers ownership of the shm handle to the caller.
+        After this call, __del__ will not close the handle."""
+        handle = self._shm_handle
+        self._shm_handle = None  # transfer ownership
+        return self.tensor, handle
+
     def __del__(self):
         # Only close; never unlink. Unlinking is materialize()'s job.
         if getattr(self, "_shm_handle", None) is not None:
@@ -1632,8 +1640,9 @@ def has_shm_features(recv_reqs):
 
 def unwrap_shm_features(obj):
     """
-    Restore ShmPointerMMData wrappers back into standard torch.Tensors.
+    Restore ShmPointerMMData wrappers back into mmap-backed torch.Tensors.
     Handles both single requests and batch requests.
+    The shm handle is stored on item._shm_handle for deferred cleanup.
     """
     if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
         return obj
@@ -1647,5 +1656,7 @@ def unwrap_shm_features(obj):
         mm_items = obj.mm_inputs.mm_items
         for item in mm_items:
             if isinstance(item.feature, ShmPointerMMData):
-                item.feature = item.feature.materialize()
+                tensor_view, shm_handle = item.feature.expose()
+                item.feature = tensor_view
+                item._shm_handle = shm_handle
     return obj
