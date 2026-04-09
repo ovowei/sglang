@@ -248,6 +248,12 @@ class MultimodalDataItem:
     # Model-specific data stored in a dictionary
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
 
+    # Shared memory handle for zero-copy mmap transport.
+    # Excluded from pickle via __getstate__.
+    _shm_handle: Any = dataclasses.field(
+        default=None, init=False, repr=False, compare=False
+    )
+
     def __getattr__(self, name: str):
         if (
             "model_specific_data" in self.__dict__
@@ -267,6 +273,25 @@ class MultimodalDataItem:
 
     def set(self, key: str, value: Any):
         self.__setitem__(key, value)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_shm_handle", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._shm_handle = None
+
+    def release_shm(self):
+        """Release the POSIX shared memory handle if held."""
+        if self._shm_handle is not None:
+            self._shm_handle.close()
+            try:
+                self._shm_handle.unlink()
+            except FileNotFoundError:
+                pass  # Another rank already unlinked
+            self._shm_handle = None
 
     @staticmethod
     def is_empty_list(l):
@@ -436,8 +461,9 @@ class MultimodalInputs:
     mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
 
     def release_features(self):
-        """Release feature tensors to free GPU memory."""
+        """Release feature tensors and shared memory handles."""
         for item in self.mm_items:
+            item.release_shm()
             item.feature = None
 
     @staticmethod
