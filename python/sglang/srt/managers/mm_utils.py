@@ -462,10 +462,17 @@ DataEmbeddingFunc = Callable[
 def _move_items_to_device(
     items: List[MultimodalDataItem], device: torch.device
 ) -> None:
-    """Move item features to the target device (in-place, non-blocking)."""
+    """Move item features to the target device (in-place, non-blocking).
+    Releases any shm handle after a successful move to a non-CPU device."""
     for item in items:
+        moved = False
         if isinstance(item.feature, torch.Tensor) and item.feature.device != device:
             item.feature = item.feature.to(device, non_blocking=True)
+            moved = True
+        # Only release shm after the feature has been copied to a new device.
+        # If no move happened or target is CPU, the tensor may still reference mmap memory.
+        if moved and device.type != "cpu" and getattr(item, "_shm_handle", None) is not None:
+            item.release_shm()
 
 
 def _get_chunked_embedding_full(
