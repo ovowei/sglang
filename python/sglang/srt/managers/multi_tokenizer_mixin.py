@@ -409,8 +409,12 @@ class TokenizerWorker(TokenizerManager):
 
         if isinstance(req, BaseReq):
             req.http_worker_ipc = self.tokenizer_ipc_name
+            for sub_obj in req.__dict__.get("_sub_obj_cache", {}).values():
+                sub_obj.http_worker_ipc = self.tokenizer_ipc_name
         elif isinstance(req, BaseBatchReq):
-            req.http_worker_ipcs = [self.tokenizer_ipc_name] * len(req.rids)
+            req.http_worker_ipcs = [self.tokenizer_ipc_name] * (len(req.rids) if req.rids else 0)
+            for sub_obj in getattr(req, "batch", []):
+                sub_obj.http_worker_ipc = self.tokenizer_ipc_name
         else:
             raise ValueError(f"Unknown req type: {type(req)}")
 

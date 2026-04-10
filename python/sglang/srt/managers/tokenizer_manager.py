@@ -535,11 +535,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
 
+        if self.server_args.tokenizer_worker_num > 1:
+            self._attach_multi_http_worker_info(obj)
         self._req_stats_init(obj, request)
         if self.server_args.language_only:
             self._handle_epd_disaggregation_encode_request(obj)
-        if self.server_args.tokenizer_worker_num > 1:
-            self._attach_multi_http_worker_info(obj)
 
         # Log the request
         self.request_logger.log_received_request(obj, self.tokenizer, request)
@@ -1171,10 +1171,20 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         ],
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
+        rids = [obj.rid for obj in tokenized_objs]
+        http_worker_ipcs = [obj.http_worker_ipc for obj in tokenized_objs]
         if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
-            batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
+            batch_req = BatchTokenizedGenerateReqInput(
+                batch=tokenized_objs,
+                rids=rids,
+                http_worker_ipcs=http_worker_ipcs,
+            )
         else:
-            batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
+            batch_req = BatchTokenizedEmbeddingReqInput(
+                batch=tokenized_objs,
+                rids=rids,
+                http_worker_ipcs=http_worker_ipcs,
+            )
 
         set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
         self.send_to_scheduler.send_pyobj(batch_req)
