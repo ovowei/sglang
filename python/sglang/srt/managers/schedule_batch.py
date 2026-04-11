@@ -1294,14 +1294,21 @@ class Req(ReqDllmMixin):
             self.extend_input_len,
         )
 
+    def release_multimodal_inputs(self, keep_for_session: bool = True):
+        """Release multimodal features and any attached shm handles."""
+        if self.multimodal_inputs is None:
+            return
+        if keep_for_session and self.session is not None:
+            return
+        self.multimodal_inputs.release_features()
+        self.multimodal_inputs = None
+
     def set_finish_with_abort(self, error_msg: str):
         if get_tensor_model_parallel_rank() == 0:
             logger.error(f"{error_msg}, {self.rid=}")
-        # Release shm handles before dropping multimodal_inputs.
-        # Skip for session requests — their mm_inputs are shared across turns.
-        if self.multimodal_inputs is not None and self.session is None:
-            self.multimodal_inputs.release_features()
-        self.multimodal_inputs = None
+        # Session-backed mm_inputs are shared across turns and get released
+        # when the session closes.
+        self.release_multimodal_inputs()
         self.grammar = None
         self.origin_input_ids = [0]  # set it to one token to skip the long prefill
         self.return_logprob = False
