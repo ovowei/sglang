@@ -5,6 +5,7 @@ Multi-modality utils
 import copy
 import hashlib
 import pickle
+import weakref
 from abc import abstractmethod
 from collections import defaultdict
 from multiprocessing import shared_memory
@@ -1582,6 +1583,85 @@ def get_new_expanded_mm_items(original_mm_items):
     return expanded_mm_items
 
 
+def _release_sm_safely(sm):
+    """Finalizer body: full close (munmap + fd close) + unlink, swallowing
+    BufferError, FileNotFoundError, and other OSErrors. Safe to invoke after
+    eager release_shm() has already happened."""
+    try:
+        sm.close()
+    except Exception:
+        pass
+    try:
+        sm.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+class ShmHandle:
+    """RAII wrapper around multiprocessing.shared_memory.SharedMemory.
+
+    The wrapper's lifetime governs whether the POSIX shm name is removed
+    from /dev/shm. close()/unlink()/__del__ all unlink the name and drop
+    our SharedMemory reference. The mmap itself stays valid because
+    ShmPointerMMData.__setstate__ also pins the SharedMemory to the torch
+    tensor's lifetime via weakref.finalize — see __setstate__ below.
+
+    IMPORTANT: We deliberately do NOT call SharedMemory.close() inside
+    ShmHandle.close(). SharedMemory.close() runs self._buf.release() +
+    self._mmap.close(), which munmap()s the region immediately.
+    torch.frombuffer() does NOT export the memoryview (verified empirically),
+    so munmap leaves any torch tensor backed by this shm with a dangling
+    pointer → segfault on next read. The full close+munmap is deferred to
+    the finalizer that fires after the tensor is GC'd.
+
+    The class exposes .buf/.name/.size and .close()/.unlink() so it is
+    drop-in compatible with the existing MultimodalDataItem.release_shm()
+    code that expects a SharedMemory-like API.
+    """
+
+    def __init__(self, sm):
+        self._sm = sm
+
+    @property
+    def buf(self):
+        return self._sm.buf if self._sm is not None else None
+
+    @property
+    def name(self):
+        return self._sm.name if self._sm is not None else None
+
+    @property
+    def size(self):
+        return self._sm.size if self._sm is not None else 0
+
+    def close(self):
+        """Unlink the POSIX name and drop our SharedMemory ref. Idempotent."""
+        sm, self._sm = self._sm, None
+        if sm is None:
+            return
+        try:
+            sm.unlink()
+        except FileNotFoundError:
+            pass  # Another rank or the finalizer already unlinked.
+        except Exception:
+            pass
+        # `sm` falls out of scope. If a weakref.finalize on a tensor still
+        # pins it, mmap stays valid until the tensor is GC'd. Otherwise the
+        # SharedMemory __del__ runs close() (munmap), which is fine since
+        # nothing references the mmap.
+
+    # Alias so callers expecting SharedMemory's API can use either name.
+    unlink = close
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 class ShmPointerMMData:
     """
     Wraps a tensor to be sent via a shared memory handle.
@@ -1606,6 +1686,12 @@ class ShmPointerMMData:
             raise
         self.shm_name = shm.name
         shm.close()
+        # Producer side: do NOT eagerly unlink. The consumer (a different
+        # process) attaches by name during pickle.loads, and eager unlink
+        # would race with consumer's SharedMemory(name=...) call. Producer
+        # cleanup of the "consumer never attaches" case is left to the
+        # multiprocessing resource_tracker which scans at parent exit. This
+        # is identical to the original 4d00bd17a behavior.
         self._shm_handle = None
 
     def __getstate__(self):
@@ -1620,7 +1706,7 @@ class ShmPointerMMData:
         self.shape = state["shape"]
         self.dtype = state["dtype"]
         self.shm = None
-        self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
+        sm = shared_memory.SharedMemory(name=self.shm_name)
         # Advise kernel to use huge pages (2MB) for this mapping.
         # Reduces page faults from ~43000 (4KB pages) to ~86, speeding up
         # the subsequent .to(cuda) transfer by ~30%.
@@ -1630,41 +1716,48 @@ class ShmPointerMMData:
             _MADV_HUGEPAGE = 14
             libc = ctypes.CDLL("libc.so.6", use_errno=True)
             addr = ctypes.c_void_p(
-                ctypes.addressof(ctypes.c_char.from_buffer(self._shm_handle.buf))
+                ctypes.addressof(ctypes.c_char.from_buffer(sm.buf))
             )
-            libc.madvise(addr, ctypes.c_size_t(self._shm_handle.size), ctypes.c_int(_MADV_HUGEPAGE))
+            libc.madvise(addr, ctypes.c_size_t(sm.size), ctypes.c_int(_MADV_HUGEPAGE))
         except Exception:
             pass  # Best-effort: not critical if it fails
-        # Zero-copy view into shared memory (no clone, no unlink)
-        self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
+        # Consumer-side RAII: ShmHandle.__del__ unlinks the name when this
+        # object is dropped through any code path (abort, GC, exception),
+        # without needing every cleanup site to call release_shm explicitly.
+        self._shm_handle = ShmHandle(sm)
+        # Zero-copy view into shared memory (no clone, no unlink).
+        self.tensor = torch.frombuffer(sm.buf, dtype=self.dtype).reshape(
             self.shape
         )
+        # Pin the SharedMemory to the tensor's lifetime via a finalizer.
+        # The finalizer holds a strong ref to sm via the bound argument, so
+        # even if ShmHandle.close() is called eagerly (release_shm or
+        # expose-then-drop), sm stays alive until the tensor is GC'd. When
+        # the tensor finally dies, the finalizer fires sm.close()+sm.unlink()
+        # which munmaps safely (no torch tensor left to read it).
+        weakref.finalize(self.tensor, _release_sm_safely, sm)
 
     def materialize(self) -> torch.Tensor:
         """Clone tensor from shm to owned memory, then release shm handle."""
         tensor = self.tensor.clone()
-        if self._shm_handle is not None:
-            self._shm_handle.close()
-            try:
-                self._shm_handle.unlink()
-            except FileNotFoundError:
-                pass  # Another rank already unlinked
-            self._shm_handle = None
+        handle, self._shm_handle = self._shm_handle, None
+        if handle is not None:
+            handle.close()
         return tensor
 
     def expose(self):
         """Return mmap-backed tensor view without cloning.
-        Transfers ownership of the shm handle to the caller.
-        After this call, __del__ will not close the handle."""
+        Transfers ownership of the ShmHandle to the caller. The tensor view
+        remains valid as long as either (a) the new owner of the handle keeps
+        the SharedMemory alive, or (b) the weakref.finalize registered in
+        __setstate__ keeps it alive — both routes work."""
         handle = self._shm_handle
         self._shm_handle = None  # transfer ownership
         return self.tensor, handle
 
-    def __del__(self):
-        # Only close; never unlink. Unlinking is materialize()'s job.
-        if getattr(self, "_shm_handle", None) is not None:
-            self._shm_handle.close()
-            self._shm_handle = None
+    # No __del__ needed: self._shm_handle (a ShmHandle) cleans up via its
+    # own __del__ when this instance is dropped, and the weakref.finalize
+    # keeps the SharedMemory alive until the tensor is GC'd.
 
 
 def _get_is_default_transport():
