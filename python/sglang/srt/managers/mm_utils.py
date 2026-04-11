@@ -994,26 +994,22 @@ def _embed_mm_inputs_with_split(
     return input_embeds, other_info
 
 
-def _all_items_fully_processed(
-    mm_input_obj: "MultimodalInputs",
-    extend_prefix_len: int,
-    extend_seq_len: int,
-) -> bool:
-    """Check if all multimodal items have been fully processed in the current chunk.
-    Returns True if every item's offset range falls within [0, prefix_len + seq_len).
-    Offsets are (start, end) tuples with inclusive ends."""
-    chunk_end = extend_prefix_len + extend_seq_len
-    for item in mm_input_obj.mm_items:
-        if item.offsets is None:
-            continue
-        for offset in item.offsets:
-            if isinstance(offset, (list, tuple)) and len(offset) == 2:
-                _, end = offset
-                if end >= chunk_end:
-                    return False
-            else:
-                if offset >= chunk_end:
-                    return False
+def _item_fully_processed(item: "MultimodalDataItem", chunk_end: int) -> bool:
+    """Return True if every offset of this item ends before chunk_end.
+
+    Items with ``offsets is None`` are conservatively reported as *not*
+    fully processed, because without concrete positions we cannot prove
+    that no future chunk will access them.
+    """
+    if item.offsets is None:
+        return False
+    for offset in item.offsets:
+        if isinstance(offset, (list, tuple)) and len(offset) == 2:
+            _, end = offset
+            if end >= chunk_end:
+                return False
+        elif offset >= chunk_end:
+            return False
     return True
 
 
@@ -1105,19 +1101,41 @@ def general_mm_embed_routine(
                     if not mm_input_obj or not hasattr(mm_input_obj, "mm_items"):
                         continue
 
-                    need_feature_offload = chunked_prefill_enabled and not _all_items_fully_processed(
-                        mm_input_obj,
-                        extend_prefix_lens[i] if i < len(extend_prefix_lens) else 0,
-                        extend_seq_lens[i] if i < len(extend_seq_lens) else 0,
+                    chunk_end = (
+                        (extend_prefix_lens[i] if i < len(extend_prefix_lens) else 0)
+                        + (extend_seq_lens[i] if i < len(extend_seq_lens) else 0)
+                    )
+
+                    # Per-item release is only safe when future chunks will use
+                    # the per-image path in _get_chunked_prefill_embedding, which
+                    # requires every item to have exactly one offset. Bundled
+                    # items (multi-offset) fall back to _get_chunked_embedding_full
+                    # which calls data_embedding_func on the whole request and
+                    # would crash on any released feature.
+                    per_image_safe = all(
+                        item.offsets is not None and len(item.offsets) == 1
+                        for item in mm_input_obj.mm_items
+                    )
+                    all_items_done = all(
+                        _item_fully_processed(item, chunk_end)
+                        for item in mm_input_obj.mm_items
                     )
 
                     for mm_item in mm_input_obj.mm_items:
                         feature = getattr(mm_item, "feature", None)
                         if isinstance(feature, torch.Tensor) and feature.is_cuda:
-                            if need_feature_offload:
-                                mm_item.feature = feature.to("cpu", non_blocking=True)
-                            else:
+                            safe_to_release = (
+                                not chunked_prefill_enabled
+                                or all_items_done
+                                or (
+                                    per_image_safe
+                                    and _item_fully_processed(mm_item, chunk_end)
+                                )
+                            )
+                            if safe_to_release:
                                 mm_item.feature = None
+                            else:
+                                mm_item.feature = feature.to("cpu", non_blocking=True)
 
                         # language_only precomputed_embeddings offload — unchanged
                         if get_global_server_args().language_only:
