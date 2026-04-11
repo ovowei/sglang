@@ -462,6 +462,11 @@ class Envs:
     SGLANG_USE_IPC_POOL_HANDLE_CACHE = EnvBool(False)
     SGLANG_MM_FEATURE_CACHE_MB = EnvInt(4 * 1024)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
+    # When 1, distribute uvicorn tokenizer workers across visible CUDA devices
+    # by rewriting CUDA_VISIBLE_DEVICES per-worker before spawn. Mirrors the
+    # scheduler maybe_reindex_device_id pattern. Requires CUDA_VISIBLE_DEVICES
+    # to be set in the parent env.
+    SGLANG_MM_WORKER_GPU_DISTRIBUTE = EnvBool(False)
 
     # Mamba
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
