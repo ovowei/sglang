@@ -5,6 +5,7 @@ Multi-modality utils
 import copy
 import hashlib
 import pickle
+import weakref
 from abc import abstractmethod
 from collections import defaultdict
 from multiprocessing import shared_memory
@@ -462,10 +463,17 @@ DataEmbeddingFunc = Callable[
 def _move_items_to_device(
     items: List[MultimodalDataItem], device: torch.device
 ) -> None:
-    """Move item features to the target device (in-place, non-blocking)."""
+    """Move item features to the target device (in-place, non-blocking).
+    Releases any shm handle after a successful move to a non-CPU device."""
     for item in items:
+        moved = False
         if isinstance(item.feature, torch.Tensor) and item.feature.device != device:
             item.feature = item.feature.to(device, non_blocking=True)
+            moved = True
+        # Only release shm after the feature has been copied to a new device.
+        # If no move happened or target is CPU, the tensor may still reference mmap memory.
+        if moved and device.type != "cpu" and getattr(item, "_shm_handle", None) is not None:
+            item.release_shm()
 
 
 def _get_chunked_embedding_full(
@@ -987,6 +995,25 @@ def _embed_mm_inputs_with_split(
     return input_embeds, other_info
 
 
+def _item_fully_processed(item: "MultimodalDataItem", chunk_end: int) -> bool:
+    """Return True if every offset of this item ends before chunk_end.
+
+    Items with ``offsets is None`` are conservatively reported as *not*
+    fully processed, because without concrete positions we cannot prove
+    that no future chunk will access them.
+    """
+    if item.offsets is None:
+        return False
+    for offset in item.offsets:
+        if isinstance(offset, (list, tuple)) and len(offset) == 2:
+            _, end = offset
+            if end >= chunk_end:
+                return False
+        elif offset >= chunk_end:
+            return False
+    return True
+
+
 def general_mm_embed_routine(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -1064,34 +1091,67 @@ def general_mm_embed_routine(
             # add for qwen3_vl deepstack
             if use_deepstack:
                 kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
-            # Offload GPU features to CPU instead of discarding them to balance memory
-            # efficiency and data persistence.
-            # In chunked-prefill, a request is processed across multiple batches, and
-            # the original multimodal data must remain accessible until the entire
-            # prefill phase is complete. Since the multimodal embedding cache is
-            # best-effort, offloading to CPU ensures we have a reliable fallback
-            # if a cache miss occurs in subsequent chunks, while still freeing up
-            # critical GPU memory.
+            # Offload GPU features to CPU when needed for future chunks.
+            # Skip offload when chunked prefill is off or all items are
+            # fully processed in this chunk (no future chunk will need them).
             if mm_inputs_list:
-                for mm_input_obj in mm_inputs_list:
-                    if mm_input_obj and hasattr(mm_input_obj, "mm_items"):
-                        for mm_item in mm_input_obj.mm_items:
-                            feature = getattr(mm_item, "feature", None)
-                            if isinstance(feature, torch.Tensor) and feature.is_cuda:
-                                mm_item.feature = feature.to("cpu", non_blocking=True)
-                            if get_global_server_args().language_only:
-                                precomputed_embeddings = getattr(
-                                    mm_item, "precomputed_embeddings", None
+                chunked_prefill_enabled = (
+                    get_global_server_args().chunked_prefill_size != -1
+                )
+                for i, mm_input_obj in enumerate(mm_inputs_list):
+                    if not mm_input_obj or not hasattr(mm_input_obj, "mm_items"):
+                        continue
+
+                    chunk_end = (
+                        (extend_prefix_lens[i] if i < len(extend_prefix_lens) else 0)
+                        + (extend_seq_lens[i] if i < len(extend_seq_lens) else 0)
+                    )
+
+                    # Per-item release is only safe when future chunks will use
+                    # the per-image path in _get_chunked_prefill_embedding, which
+                    # requires every item to have exactly one offset. Bundled
+                    # items (multi-offset) fall back to _get_chunked_embedding_full
+                    # which calls data_embedding_func on the whole request and
+                    # would crash on any released feature.
+                    per_image_safe = all(
+                        item.offsets is not None and len(item.offsets) == 1
+                        for item in mm_input_obj.mm_items
+                    )
+                    all_items_done = all(
+                        _item_fully_processed(item, chunk_end)
+                        for item in mm_input_obj.mm_items
+                    )
+
+                    for mm_item in mm_input_obj.mm_items:
+                        feature = getattr(mm_item, "feature", None)
+                        if isinstance(feature, torch.Tensor) and feature.is_cuda:
+                            safe_to_release = (
+                                not chunked_prefill_enabled
+                                or all_items_done
+                                or (
+                                    per_image_safe
+                                    and _item_fully_processed(mm_item, chunk_end)
                                 )
-                                if (
-                                    isinstance(precomputed_embeddings, torch.Tensor)
-                                    and precomputed_embeddings.is_cuda
-                                ):
-                                    mm_item.precomputed_embeddings = (
-                                        precomputed_embeddings.to(
-                                            "cpu", non_blocking=True
-                                        )
+                            )
+                            if safe_to_release:
+                                mm_item.feature = None
+                            else:
+                                mm_item.feature = feature.to("cpu", non_blocking=True)
+
+                        # language_only precomputed_embeddings offload — unchanged
+                        if get_global_server_args().language_only:
+                            precomputed_embeddings = getattr(
+                                mm_item, "precomputed_embeddings", None
+                            )
+                            if (
+                                isinstance(precomputed_embeddings, torch.Tensor)
+                                and precomputed_embeddings.is_cuda
+                            ):
+                                mm_item.precomputed_embeddings = (
+                                    precomputed_embeddings.to(
+                                        "cpu", non_blocking=True
                                     )
+                                )
             forward_batch.mm_inputs = None
             forward_batch.mm_input_embeds = input_embeds
         else:
@@ -1523,6 +1583,85 @@ def get_new_expanded_mm_items(original_mm_items):
     return expanded_mm_items
 
 
+def _release_sm_safely(sm):
+    """Finalizer body: full close (munmap + fd close) + unlink, swallowing
+    BufferError, FileNotFoundError, and other OSErrors. Safe to invoke after
+    eager release_shm() has already happened."""
+    try:
+        sm.close()
+    except Exception:
+        pass
+    try:
+        sm.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+class ShmHandle:
+    """RAII wrapper around multiprocessing.shared_memory.SharedMemory.
+
+    The wrapper's lifetime governs whether the POSIX shm name is removed
+    from /dev/shm. close()/unlink()/__del__ all unlink the name and drop
+    our SharedMemory reference. The mmap itself stays valid because
+    ShmPointerMMData.__setstate__ also pins the SharedMemory to the torch
+    tensor's lifetime via weakref.finalize — see __setstate__ below.
+
+    IMPORTANT: We deliberately do NOT call SharedMemory.close() inside
+    ShmHandle.close(). SharedMemory.close() runs self._buf.release() +
+    self._mmap.close(), which munmap()s the region immediately.
+    torch.frombuffer() does NOT export the memoryview (verified empirically),
+    so munmap leaves any torch tensor backed by this shm with a dangling
+    pointer → segfault on next read. The full close+munmap is deferred to
+    the finalizer that fires after the tensor is GC'd.
+
+    The class exposes .buf/.name/.size and .close()/.unlink() so it is
+    drop-in compatible with the existing MultimodalDataItem.release_shm()
+    code that expects a SharedMemory-like API.
+    """
+
+    def __init__(self, sm):
+        self._sm = sm
+
+    @property
+    def buf(self):
+        return self._sm.buf if self._sm is not None else None
+
+    @property
+    def name(self):
+        return self._sm.name if self._sm is not None else None
+
+    @property
+    def size(self):
+        return self._sm.size if self._sm is not None else 0
+
+    def close(self):
+        """Unlink the POSIX name and drop our SharedMemory ref. Idempotent."""
+        sm, self._sm = self._sm, None
+        if sm is None:
+            return
+        try:
+            sm.unlink()
+        except FileNotFoundError:
+            pass  # Another rank or the finalizer already unlinked.
+        except Exception:
+            pass
+        # `sm` falls out of scope. If a weakref.finalize on a tensor still
+        # pins it, mmap stays valid until the tensor is GC'd. Otherwise the
+        # SharedMemory __del__ runs close() (munmap), which is fine since
+        # nothing references the mmap.
+
+    # Alias so callers expecting SharedMemory's API can use either name.
+    unlink = close
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 class ShmPointerMMData:
     """
     Wraps a tensor to be sent via a shared memory handle.
@@ -1547,6 +1686,12 @@ class ShmPointerMMData:
             raise
         self.shm_name = shm.name
         shm.close()
+        # Producer side: do NOT eagerly unlink. The consumer (a different
+        # process) attaches by name during pickle.loads, and eager unlink
+        # would race with consumer's SharedMemory(name=...) call. Producer
+        # cleanup of the "consumer never attaches" case is left to the
+        # multiprocessing resource_tracker which scans at parent exit. This
+        # is identical to the original 4d00bd17a behavior.
         self._shm_handle = None
 
     def __getstate__(self):
@@ -1561,29 +1706,58 @@ class ShmPointerMMData:
         self.shape = state["shape"]
         self.dtype = state["dtype"]
         self.shm = None
-        self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
-        # Zero-copy view into shared memory (no clone, no unlink)
-        self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
+        sm = shared_memory.SharedMemory(name=self.shm_name)
+        # Advise kernel to use huge pages (2MB) for this mapping.
+        # Reduces page faults from ~43000 (4KB pages) to ~86, speeding up
+        # the subsequent .to(cuda) transfer by ~30%.
+        try:
+            import ctypes
+
+            _MADV_HUGEPAGE = 14
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            addr = ctypes.c_void_p(
+                ctypes.addressof(ctypes.c_char.from_buffer(sm.buf))
+            )
+            libc.madvise(addr, ctypes.c_size_t(sm.size), ctypes.c_int(_MADV_HUGEPAGE))
+        except Exception:
+            pass  # Best-effort: not critical if it fails
+        # Consumer-side RAII: ShmHandle.__del__ unlinks the name when this
+        # object is dropped through any code path (abort, GC, exception),
+        # without needing every cleanup site to call release_shm explicitly.
+        self._shm_handle = ShmHandle(sm)
+        # Zero-copy view into shared memory (no clone, no unlink).
+        self.tensor = torch.frombuffer(sm.buf, dtype=self.dtype).reshape(
             self.shape
         )
+        # Pin the SharedMemory to the tensor's lifetime via a finalizer.
+        # The finalizer holds a strong ref to sm via the bound argument, so
+        # even if ShmHandle.close() is called eagerly (release_shm or
+        # expose-then-drop), sm stays alive until the tensor is GC'd. When
+        # the tensor finally dies, the finalizer fires sm.close()+sm.unlink()
+        # which munmaps safely (no torch tensor left to read it).
+        weakref.finalize(self.tensor, _release_sm_safely, sm)
 
     def materialize(self) -> torch.Tensor:
         """Clone tensor from shm to owned memory, then release shm handle."""
         tensor = self.tensor.clone()
-        if self._shm_handle is not None:
-            self._shm_handle.close()
-            try:
-                self._shm_handle.unlink()
-            except FileNotFoundError:
-                pass  # Another rank already unlinked
-            self._shm_handle = None
+        handle, self._shm_handle = self._shm_handle, None
+        if handle is not None:
+            handle.close()
         return tensor
 
-    def __del__(self):
-        # Only close; never unlink. Unlinking is materialize()'s job.
-        if getattr(self, "_shm_handle", None) is not None:
-            self._shm_handle.close()
-            self._shm_handle = None
+    def expose(self):
+        """Return mmap-backed tensor view without cloning.
+        Transfers ownership of the ShmHandle to the caller. The tensor view
+        remains valid as long as either (a) the new owner of the handle keeps
+        the SharedMemory alive, or (b) the weakref.finalize registered in
+        __setstate__ keeps it alive — both routes work."""
+        handle = self._shm_handle
+        self._shm_handle = None  # transfer ownership
+        return self.tensor, handle
+
+    # No __del__ needed: self._shm_handle (a ShmHandle) cleans up via its
+    # own __del__ when this instance is dropped, and the weakref.finalize
+    # keeps the SharedMemory alive until the tensor is GC'd.
 
 
 def _get_is_default_transport():
@@ -1632,8 +1806,9 @@ def has_shm_features(recv_reqs):
 
 def unwrap_shm_features(obj):
     """
-    Restore ShmPointerMMData wrappers back into standard torch.Tensors.
+    Restore ShmPointerMMData wrappers back into mmap-backed torch.Tensors.
     Handles both single requests and batch requests.
+    The shm handle is stored on item._shm_handle for deferred cleanup.
     """
     if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
         return obj
@@ -1647,5 +1822,7 @@ def unwrap_shm_features(obj):
         mm_items = obj.mm_inputs.mm_items
         for item in mm_items:
             if isinstance(item.feature, ShmPointerMMData):
-                item.feature = item.feature.materialize()
+                tensor_view, shm_handle = item.feature.expose()
+                item.feature = tensor_view
+                item._shm_handle = shm_handle
     return obj

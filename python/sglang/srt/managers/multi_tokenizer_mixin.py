@@ -48,6 +48,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.environ import envs
 from sglang.utils import get_exception_traceback
 
 if TYPE_CHECKING:
@@ -483,18 +484,241 @@ def write_data_for_multi_tokenizer(
     return args_shm
 
 
-def monkey_patch_uvicorn_multiprocessing(timeout: float = 10):
-    """Monkey patch uvicorn multiprocessing is_alive timeout"""
-    # from default 5s -> 10s
+def _p2p_preflight_check(gpu_ids):
+    """Verify every pair in gpu_ids has P2P read access enabled via NVML.
+
+    Raises RuntimeError if pynvml is unavailable, NVML init fails, or any
+    pair lacks P2P read access. Caller (the planner) should not catch
+    this — the user explicitly opted into distribution and a silent
+    fallback would reproduce the OOM the feature exists to fix.
+
+    `gpu_ids` is a list of physical device id strings (as they appear in
+    CUDA_VISIBLE_DEVICES). NVML uses physical indices independently of
+    CUDA_VISIBLE_DEVICES, so we convert directly via int().
+
+    Pattern follows custom_all_reduce_utils.is_full_nvlink (same module
+    already uses pynvml). nvmlInit() does NOT initialize a CUDA context,
+    so calling this in the parent process is safe before worker spawn.
+    """
     try:
-        from uvicorn.supervisors.multiprocess import Process
+        import pynvml
+    except ImportError as e:
+        raise RuntimeError(
+            f"[mm_worker_distribute] P2P preflight requires pynvml "
+            f"(nvidia-ml-py) but it is not available: {e}"
+        )
+    if pynvml is None:
+        raise RuntimeError(
+            "[mm_worker_distribute] P2P preflight requires pynvml "
+            "but the import returned None"
+        )
 
-        Process.is_alive = partialmethod(Process.is_alive, timeout=timeout)
+    pynvml.nvmlInit()
+    try:
+        phys_ids = [int(g) for g in gpu_ids]
+        handles = {p: pynvml.nvmlDeviceGetHandleByIndex(p) for p in phys_ids}
+        # Use NVML_P2P_CAPS_INDEX_NVLINK (= 2). Same index used by
+        # custom_all_reduce_utils.is_full_nvlink, proven to work in this
+        # codebase. On the production target (H100/H200/H800/B300 + NVLink)
+        # this is equivalent to "P2P read access available". The
+        # NVML_P2P_CAPS_INDEX_READ constant has a type issue in some pynvml
+        # builds; we hard-code the int 2 instead of relying on the symbol.
+        p2p_index_nvlink = 2
+        failed = []
+        for a in phys_ids:
+            for b in phys_ids:
+                if a == b:
+                    continue
+                try:
+                    status = pynvml.nvmlDeviceGetP2PStatus(
+                        handles[a], handles[b], p2p_index_nvlink
+                    )
+                except pynvml.NVMLError as e:
+                    failed.append(f"GPU{a}->GPU{b}: NVML error {e}")
+                    continue
+                if status != pynvml.NVML_P2P_STATUS_OK:
+                    failed.append(f"GPU{a}->GPU{b}: status={status}")
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
 
+    if failed:
+        raise RuntimeError(
+            "[mm_worker_distribute] P2P preflight FAILED. The feature "
+            "requires every (worker GPU, scheduler GPU) pair to have "
+            "P2P read access enabled. Failures:\n  "
+            + "\n  ".join(failed)
+            + "\nDisable SGLANG_MM_WORKER_GPU_DISTRIBUTE or fix the "
+            "topology (NVLink) and retry."
+        )
+
+
+def _detect_gpu_ids():
+    """Detect available GPU ids without CUDA context or CUDA_VISIBLE_DEVICES.
+
+    Priority:
+    1. CUDA_VISIBLE_DEVICES env var (if set)
+    2. pynvml enumeration (no CUDA context needed)
+
+    Returns a list of physical GPU id strings, e.g. ["0","1","2","3"].
+    """
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cvd:
+        return [g.strip() for g in cvd.split(",") if g.strip()]
+
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            n = pynvml.nvmlDeviceGetCount()
+            return [str(i) for i in range(n)]
+        finally:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"[mm_worker_distribute] pynvml GPU enumeration failed: {e}")
+        return []
+
+
+def _plan_slots_for(processes_num: int):
+    """Decide whether to distribute tokenizer workers across GPUs.
+
+    Returns a list of physical GPU ids to round-robin across, or None if
+    distribution should be disabled (no-op fall through to upstream
+    behavior).
+
+    GPU ids are detected via CUDA_VISIBLE_DEVICES (if set) or pynvml
+    enumeration (no CUDA context needed, safe to call before scheduler
+    spawn). This avoids requiring the user to set CUDA_VISIBLE_DEVICES,
+    which can break NCCL init in some disaggregation configs.
+
+    When distribution is enabled, runs a P2P preflight against the
+    selected GPU set; raises RuntimeError if any pair lacks P2P. The
+    raise is intentional — the user opted in via env var, and silently
+    falling back to single-GPU would reproduce the OOM the feature
+    exists to fix.
+    """
+    if not envs.SGLANG_MM_WORKER_GPU_DISTRIBUTE.get():
+        return None
+    gpu_ids = _detect_gpu_ids()
+    if len(gpu_ids) <= 1:
+        logger.warning(
+            "[mm_worker_distribute] requested but only %d GPU(s) detected; "
+            "skipping", len(gpu_ids)
+        )
+        return None
+    if processes_num <= 1:
+        return None
+    _p2p_preflight_check(gpu_ids)
+    return gpu_ids
+
+
+def monkey_patch_uvicorn_multiprocessing(timeout: float = 10):
+    """Monkey patch uvicorn Multiprocess.
+
+    Two patches:
+    1. Existing: extend Process.is_alive default timeout. (Note: in current
+       upstream uvicorn, keep_subprocess_alive passes timeout= explicitly,
+       which overrides the partialmethod default; this patch is preserved
+       as-is from prior code and is version-sensitive.)
+    2. New (when SGLANG_MM_WORKER_GPU_DISTRIBUTE=1): rewrite parent
+       CUDA_VISIBLE_DEVICES per worker slot before each Process spawn,
+       restore after, so each worker child sees only one logical cuda:0.
+       Mirrors the scheduler maybe_reindex_device_id pattern.
+    """
+    try:
+        from uvicorn.supervisors import multiprocess as uvm
     except ImportError:
         logger.warning(
             "uvicorn.supervisors.multiprocess not found, skipping monkey patch"
         )
+        return
+
+    # 1. Existing: extend Process.is_alive default timeout
+    uvm.Process.is_alive = partialmethod(uvm.Process.is_alive, timeout=timeout)
+
+    # 2. New: GPU distribution patches
+    UvicornProcess = uvm.Process
+
+    def _spawn_pinned(multiprocess_self, idx):
+        """Construct + start a uvicorn Process with CVD pinned for slot idx.
+
+        If self._sglang_phys_gpus is None, falls through to unmodified
+        behavior. Otherwise temporarily rewrites
+        os.environ["CUDA_VISIBLE_DEVICES"] to the slot's physical GPU id,
+        constructs and starts the Process (CPython spawn captures the env
+        at .start() time), then restores the parent env.
+        """
+        phys_gpus = getattr(multiprocess_self, "_sglang_phys_gpus", None)
+        original_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        target = None
+        if phys_gpus is not None:
+            target = phys_gpus[idx % len(phys_gpus)]
+            os.environ["CUDA_VISIBLE_DEVICES"] = target
+        try:
+            process = UvicornProcess(
+                multiprocess_self.config,
+                multiprocess_self.target,
+                multiprocess_self.sockets,
+            )
+            process.start()
+        finally:
+            if phys_gpus is not None:
+                if original_cvd is None:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                else:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = original_cvd
+        if target is not None:
+            logger.info(
+                f"[mm_worker_distribute] worker slot={idx} pid={process.pid} "
+                f"pinned to CUDA_VISIBLE_DEVICES={target}"
+            )
+        return process
+
+    def patched_init_processes(self):
+        self._sglang_phys_gpus = _plan_slots_for(self.processes_num)
+        if self._sglang_phys_gpus is not None:
+            logger.info(
+                f"[mm_worker_distribute] {self.processes_num} workers "
+                f"will round-robin across {self._sglang_phys_gpus}"
+            )
+        for idx in range(self.processes_num):
+            self.processes.append(_spawn_pinned(self, idx))
+
+    def patched_keep_subprocess_alive(self):
+        if self.should_exit.is_set():
+            return
+        for idx, process in enumerate(self.processes):
+            if process.is_alive(timeout=self.config.timeout_worker_healthcheck):
+                continue
+            process.kill()
+            process.join()
+            if self.should_exit.is_set():
+                return
+            logger.info(f"Child process [{process.pid}] died")
+            self.processes[idx] = _spawn_pinned(self, idx)
+
+    def patched_restart_all(self):
+        for idx, process in enumerate(self.processes):
+            process.terminate()
+            process.join()
+            self.processes[idx] = _spawn_pinned(self, idx)
+
+    def patched_handle_ttin(self):
+        # SIGTTIN: append a new worker. Slot index = current len(processes).
+        self.processes_num += 1
+        idx = len(self.processes)
+        self.processes.append(_spawn_pinned(self, idx))
+
+    uvm.Multiprocess.init_processes = patched_init_processes
+    uvm.Multiprocess.keep_subprocess_alive = patched_keep_subprocess_alive
+    uvm.Multiprocess.restart_all = patched_restart_all
+    uvm.Multiprocess.handle_ttin = patched_handle_ttin
 
 
 class SenderWrapper:

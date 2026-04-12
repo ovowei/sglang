@@ -546,6 +546,8 @@ def is_mla_backend(target_kv_pool) -> bool:
 def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
+    req.release_multimodal_inputs()
+
     # populate finish metadata and stream output
     req.finished_reason = FINISH_ABORT(error_message, status_code)
 
