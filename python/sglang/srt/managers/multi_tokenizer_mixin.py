@@ -555,13 +555,47 @@ def _p2p_preflight_check(gpu_ids):
         )
 
 
+def _detect_gpu_ids():
+    """Detect available GPU ids without CUDA context or CUDA_VISIBLE_DEVICES.
+
+    Priority:
+    1. CUDA_VISIBLE_DEVICES env var (if set)
+    2. pynvml enumeration (no CUDA context needed)
+
+    Returns a list of physical GPU id strings, e.g. ["0","1","2","3"].
+    """
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cvd:
+        return [g.strip() for g in cvd.split(",") if g.strip()]
+
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            n = pynvml.nvmlDeviceGetCount()
+            return [str(i) for i in range(n)]
+        finally:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"[mm_worker_distribute] pynvml GPU enumeration failed: {e}")
+        return []
+
+
 def _plan_slots_for(processes_num: int):
     """Decide whether to distribute tokenizer workers across GPUs.
 
-    Returns a list of physical GPU ids (strings, as they appear in the
-    parent's CUDA_VISIBLE_DEVICES) to round-robin across, or None if
+    Returns a list of physical GPU ids to round-robin across, or None if
     distribution should be disabled (no-op fall through to upstream
     behavior).
+
+    GPU ids are detected via CUDA_VISIBLE_DEVICES (if set) or pynvml
+    enumeration (no CUDA context needed, safe to call before scheduler
+    spawn). This avoids requiring the user to set CUDA_VISIBLE_DEVICES,
+    which can break NCCL init in some disaggregation configs.
 
     When distribution is enabled, runs a P2P preflight against the
     selected GPU set; raises RuntimeError if any pair lacks P2P. The
@@ -571,15 +605,14 @@ def _plan_slots_for(processes_num: int):
     """
     if not envs.SGLANG_MM_WORKER_GPU_DISTRIBUTE.get():
         return None
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if not cvd:
+    gpu_ids = _detect_gpu_ids()
+    if len(gpu_ids) <= 1:
         logger.warning(
-            "[mm_worker_distribute] requested but CUDA_VISIBLE_DEVICES is "
-            "not set in the parent env; cannot infer the GPU set; skipping"
+            "[mm_worker_distribute] requested but only %d GPU(s) detected; "
+            "skipping", len(gpu_ids)
         )
         return None
-    gpu_ids = [g.strip() for g in cvd.split(",") if g.strip()]
-    if len(gpu_ids) <= 1 or processes_num <= 1:
+    if processes_num <= 1:
         return None
     _p2p_preflight_check(gpu_ids)
     return gpu_ids

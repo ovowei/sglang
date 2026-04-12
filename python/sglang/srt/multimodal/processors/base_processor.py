@@ -1156,6 +1156,15 @@ class BaseMultimodalProcessor(ABC):
         """
 
         if SGL_USE_CUDA_IPC:
+            # Compute hash before IPC wrapping: once the tensor is wrapped
+            # in CudaIpcTensorTransportProxy, the same process cannot
+            # reconstruct its own IPC handle (CUDA forbids
+            # cudaIpcOpenMemHandle on handles created in the same process).
+            if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
+                for item in all_collected_items:
+                    if item.hash is None:
+                        item.set_pad_value()
+
             # post-process
             for item in all_collected_items:
                 if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
@@ -1180,8 +1189,17 @@ class BaseMultimodalProcessor(ABC):
                             pool_byte_offset=byte_offset,
                             pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
                         )
-                    elif not self.server_args.keep_mm_feature_on_device:
-                        item.feature = item.feature.cpu()
+                    else:
+                        logger.warning(
+                            "[mm_ipc_pool] pool full, feature fallback to CPU "
+                            "(size=%d bytes, pool occupied=%d/%d chunks)",
+                            item.feature.numel() * item.feature.element_size(),
+                            len(self.cudaipc_mmfeature_pool.occupied_chunks),
+                            len(self.cudaipc_mmfeature_pool.occupied_chunks)
+                            + len(self.cudaipc_mmfeature_pool.available_chunks),
+                        )
+                        if not self.server_args.keep_mm_feature_on_device:
+                            item.feature = item.feature.cpu()
                 elif (
                     isinstance(item.precomputed_embeddings, torch.Tensor)
                     and item.precomputed_embeddings.is_cuda
