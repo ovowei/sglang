@@ -128,6 +128,12 @@ class PromptTokensDetails(BaseModel):
     cached_tokens: int = 0
 
 
+class CompletionTokensDetails(BaseModel):
+    """Details about completion tokens."""
+
+    reasoning_tokens: int = 0
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
@@ -135,6 +141,7 @@ class UsageInfo(BaseModel):
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
+    completion_tokens_details: Optional[CompletionTokensDetails] = None
 
 
 class StreamOptions(BaseModel):
@@ -751,41 +758,16 @@ class ChatCompletionRequest(BaseModel):
         stop: List[str],
         model_generation_config: Dict[str, Any],
         tool_call_constraint: Optional[ToolCallConstraint] = None,
+        fixed_sampling_overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Convert request to sampling parameters.
-        Priority: user value > model generation_config > OpenAI defaults
+        Priority: fixed_sampling_overrides (if any) > user value > model generation_config > OpenAI defaults
         """
-        
-        #is_think_mode = False if self.thinking and self.thinking.get("type") == "disabled" else True
-        is_think_mode = False if self.chat_template_kwargs and self.chat_template_kwargs.get("thinking", None)==False else True
-
-        if is_think_mode:
-            fixed_defaults = {
-                "temperature": 1.0,
-                "top_p": 0.95,
-                "presence_penalty": 0.0,
-                "frequency_penalty": 0.0,
-                "n": 1,
-            }
-        else:
-            fixed_defaults = {
-                "temperature": 0.6,
-                "top_p": 0.95,
-                "presence_penalty": 0.0,
-                "frequency_penalty": 0.0,
-                "n": 1,
-            }
-
-        #protected_params = ["temperature", "top_p", "presence_penalty", "frequency_penalty", "n"]
-        #for param in protected_params:
-        #    user_value = getattr(self, param)
-        #    if user_value is not None and user_value != fixed_defaults[param]:
-        #        raise ValueError(f"Parameter '{param}' cannot be overridden. Fixed value: {fixed_defaults[param]}")
 
         def get_param(param_name: str):
-            if param_name in fixed_defaults:
-                return fixed_defaults[param_name]
+            if fixed_sampling_overrides and param_name in fixed_sampling_overrides:
+                return fixed_sampling_overrides[param_name]
             value = getattr(self, param_name)
             if value is None:
                 return model_generation_config.get(

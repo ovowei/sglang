@@ -50,6 +50,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
 
+        # Detect model type from model path for model-specific behavior
+        model_path = self.tokenizer_manager.server_args.model_path.lower()
+        self.is_glm = "glm" in model_path
+
     def _request_id_prefix(self) -> str:
         return "cmpl-"
 
@@ -344,6 +348,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         prompt_tokens=prompt_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
                         reasoning_tokens=reasoning_tokens.get(index, 0),
+                        use_completion_details=self.is_glm,
                     )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
@@ -398,6 +403,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     cached_tokens=cached_tokens,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+                    use_completion_details=self.is_glm,
                 )
                 final_usage_chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -523,7 +529,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # Calculate usage
         cache_report = self.tokenizer_manager.server_args.enable_cache_report
         usage = UsageProcessor.calculate_response_usage(
-            ret, n_choices=request.n, enable_cache_report=cache_report
+            ret, n_choices=request.n, enable_cache_report=cache_report,
+            use_completion_details=self.is_glm,
         )
 
         return CompletionResponse(

@@ -121,6 +121,11 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
         )
 
+        # Detect model type from model path for model-specific behavior
+        model_path = self.tokenizer_manager.server_args.model_path.lower()
+        self.is_kimi = "kimi" in model_path
+        self.is_glm = "glm" in model_path
+
         self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
 
     def _handle_last_assistant_message(
@@ -237,41 +242,30 @@ class OpenAIServingChat(OpenAIServingBase):
             if schema is None:
                 return "schema_ is required for json_schema response format request."
 
-        # 添加固定参数验证
-        #is_think_mode = False if request.thinking and request.thinking.get("type") == "disabled" else True
-        is_think_mode = False if request.chat_template_kwargs and request.chat_template_kwargs.get("thinking", None)==False else True
-        
-        if is_think_mode:
-            expected_params = {
-                "temperature": 1.0,
-                "top_p": 0.95,
-                "presence_penalty": 0.0,
-                "frequency_penalty": 0.0,
-                "n": 1,
-            }
-        else:
-            expected_params = {
-                "temperature": 0.6,
-                "top_p": 0.95,
-                "presence_penalty": 0.0,
-                "frequency_penalty": 0.0,
-                "n": 1,
-            }
-        #import os
-        #with open("/tmp/debug_sampling_params.log", "a") as f:
-        #    f.write(f"PID {os.getpid()}: request={request} is_think_mdoe={is_think_mode} expected_params={expected_params}\n")
-        #    f.flush()
-
-        # 检查用户是否尝试修改固定参数
-        for param, expected_value in expected_params.items():
-            #with open("/tmp/debug_sampling_params.log", "a") as f:
-            #    f.write(f"#### param:{param} expected_value:{expected_value}\n")
-            #    f.flush()
-            user_value = getattr(request, param)
-            if user_value is not None and abs(user_value - expected_value) >= 1e-3:
-                return f"Parameter '{param}' cannot be overridden. Expected: {expected_value}, Got: {user_value}"
+        # Kimi: validate that fixed sampling parameters are not overridden
+        if self.is_kimi:
+            is_think_mode = not (
+                request.chat_template_kwargs
+                and request.chat_template_kwargs.get("thinking") is False
+            )
+            expected_params = self._get_kimi_fixed_params(is_think_mode)
+            for param, expected_value in expected_params.items():
+                user_value = getattr(request, param)
+                if user_value is not None and abs(user_value - expected_value) >= 1e-3:
+                    return f"Parameter '{param}' cannot be overridden. Expected: {expected_value}, Got: {user_value}"
 
         return None
+
+    @staticmethod
+    def _get_kimi_fixed_params(is_think_mode: bool) -> Dict[str, float]:
+        """Return Kimi's fixed sampling parameters based on thinking mode."""
+        return {
+            "temperature": 1.0 if is_think_mode else 0.6,
+            "top_p": 0.95,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "n": 1,
+        }
 
     def _convert_to_internal_request(
         self,
@@ -298,10 +292,18 @@ class OpenAIServingChat(OpenAIServingBase):
         processed_messages = self._process_messages(request, is_multimodal)
 
         # Build sampling parameters
+        fixed_overrides = None
+        if self.is_kimi:
+            is_think_mode = not (
+                request.chat_template_kwargs
+                and request.chat_template_kwargs.get("thinking") is False
+            )
+            fixed_overrides = self._get_kimi_fixed_params(is_think_mode)
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
+            fixed_sampling_overrides=fixed_overrides,
         )
 
         # Handle single vs multiple requests
@@ -427,15 +429,13 @@ class OpenAIServingChat(OpenAIServingBase):
 
         template_content_format = self.template_manager.jinja_template_content_format
 
-        if request.thinking is not None:
-            # 如果 chat_template_kwargs 为 None，先初始化为空字典
+        # Kimi: convert thinking field to chat_template_kwargs
+        if self.is_kimi and request.thinking is not None:
             if request.chat_template_kwargs is None:
                 request.chat_template_kwargs = {}
-
-            if request.thinking.get("type") == "disabled":
-                request.chat_template_kwargs["thinking"] = False
-            else:
-                request.chat_template_kwargs["thinking"] = True
+            request.chat_template_kwargs["thinking"] = (
+                request.thinking.get("type") != "disabled"
+            )
 
         if self.use_dpsk_v32_encoding:
             thinking_mode = (
@@ -802,6 +802,7 @@ class OpenAIServingChat(OpenAIServingBase):
                                 prompt_tokens=prompt_tokens.get(index, 0),
                                 reasoning_tokens=reasoning_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
+                                use_completion_details=self.is_glm,
                             )
 
                         yield f"data: {chunk.model_dump_json()}\n\n"
@@ -856,6 +857,7 @@ class OpenAIServingChat(OpenAIServingBase):
                                 prompt_tokens=prompt_tokens.get(index, 0),
                                 reasoning_tokens=reasoning_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
+                                use_completion_details=self.is_glm,
                             )
 
                         yield f"data: {chunk.model_dump_json()}\n\n"
@@ -940,6 +942,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     cached_tokens=cached_tokens,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+                    use_completion_details=self.is_glm,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -1081,6 +1084,7 @@ class OpenAIServingChat(OpenAIServingBase):
             ret,
             n_choices=request.n,
             enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+            use_completion_details=self.is_glm,
         )
 
         return ChatCompletionResponse(
@@ -1417,6 +1421,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     reasoning_tokens=reasoning_tokens,
+                    use_completion_details=self.is_glm,
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
@@ -1469,6 +1474,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     reasoning_tokens=reasoning_tokens,
+                    use_completion_details=self.is_glm,
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"

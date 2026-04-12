@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, Optional, final
 
-from sglang.srt.entrypoints.openai.protocol import PromptTokensDetails, UsageInfo
+from sglang.srt.entrypoints.openai.protocol import CompletionTokensDetails, PromptTokensDetails, UsageInfo
 
 
 @final
@@ -19,6 +19,7 @@ class UsageProcessor:
         responses: List[Dict[str, Any]],
         n_choices: int = 1,
         enable_cache_report: bool = False,
+        use_completion_details: bool = False,
     ) -> UsageInfo:
         completion_tokens = sum(
             r["meta_info"].get("completion_tokens", 0) for r in responses
@@ -46,6 +47,7 @@ class UsageProcessor:
             reasoning_tokens=reasoning_tokens,
             completion_tokens=completion_tokens,
             cached_tokens=cached_details,
+            use_completion_details=use_completion_details,
         )
 
     @staticmethod
@@ -56,6 +58,7 @@ class UsageProcessor:
         cached_tokens: Mapping[int, int],
         n_choices: int,
         enable_cache_report: bool = False,
+        use_completion_details: bool = False,
     ) -> UsageInfo:
         # index % n_choices == 0 marks the first choice of a prompt
         total_prompt_tokens = sum(
@@ -77,6 +80,7 @@ class UsageProcessor:
             reasoning_tokens=total_reasoning_tokens,
             completion_tokens=total_completion_tokens,
             cached_tokens=cached_details,
+            use_completion_details=use_completion_details,
         )
 
     @staticmethod
@@ -85,8 +89,17 @@ class UsageProcessor:
         completion_tokens: int,
         reasoning_tokens: Optional[int] = 0,
         cached_tokens: Optional[PromptTokensDetails] = None,
+        use_completion_details: bool = False,
     ) -> UsageInfo:
         """Calculate token usage information"""
+        if use_completion_details:
+            return UsageInfo(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+                prompt_tokens_details=cached_tokens,
+                completion_tokens_details=CompletionTokensDetails(reasoning_tokens=reasoning_tokens) if reasoning_tokens else None,
+            )
         return UsageInfo(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
