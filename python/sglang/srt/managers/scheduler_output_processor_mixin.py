@@ -538,7 +538,8 @@ class SchedulerOutputProcessorMixin:
 
         if req.finished():
             # delete feature to save memory
-            req.release_multimodal_inputs()
+            if req.multimodal_inputs is not None and req.session is None:
+                req.multimodal_inputs.release_features()
             self.maybe_collect_routed_experts(req)
 
             if self.server_args.disaggregation_decode_enable_offload_kvcache:

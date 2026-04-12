@@ -1796,13 +1796,14 @@ class Scheduler(
 
     def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
-            if not req.finished() or req.multimodal_inputs is None:
+            if not req.finished() or not (mm_inputs := req.multimodal_inputs):
                 continue
             # For session requests, keep mm_inputs for the next request
             if req.session:
                 continue
             # For non-session requests, clear features and mm_inputs
-            req.release_multimodal_inputs()
+            mm_inputs.release_features()
+            req.multimodal_inputs = None
 
     def handle_generate_request(
         self,
@@ -2052,7 +2053,6 @@ class Scheduler(
             and req.priority is not None
             and self.abort_on_priority_when_disabled
         ):
-            req.release_multimodal_inputs()
             abort_req = AbortReq(
                 finished_reason={
                     "type": "abort",
@@ -2101,7 +2101,6 @@ class Scheduler(
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
-        req_to_abort.release_multimodal_inputs()
         self.send_to_tokenizer.send_output(
             AbortReq(
                 finished_reason={
@@ -2125,7 +2124,6 @@ class Scheduler(
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
-                req.release_multimodal_inputs()
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
@@ -2673,7 +2671,6 @@ class Scheduler(
             self.new_token_ratio = new_token_ratio
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
-                req.release_multimodal_inputs()
                 self.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason=abort_reason.to_json(),
@@ -3285,7 +3282,6 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            req.release_multimodal_inputs()
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
@@ -3351,7 +3347,6 @@ class Scheduler(
                     if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
                         assert hasattr(decode_req, "kv_cache_cpu")
                         del decode_req.kv_cache_cpu
-                        decode_req.release_multimodal_inputs()
                         self.send_to_tokenizer.send_output(
                             AbortReq(rid=decode_req.rid), decode_req
                         )
