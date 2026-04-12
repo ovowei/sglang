@@ -894,12 +894,10 @@ class Scheduler(
             HybridLinearKVPool,
             MHATokenToKVPool,
             MLATokenToKVPool,
-            NSATokenToKVPool,
         )
         from sglang.srt.mem_cache.memory_pool_host import (
             MHATokenToKVPoolHost,
             MLATokenToKVPoolHost,
-            NSATokenToKVPoolHost,
         )
 
         pool = draft_kv_pool
@@ -917,8 +915,6 @@ class Scheduler(
         )
         if isinstance(pool, MHATokenToKVPool):
             draft_host_pool = MHATokenToKVPoolHost(pool, **kw)
-        elif isinstance(pool, NSATokenToKVPool):
-            draft_host_pool = NSATokenToKVPoolHost(pool, **kw)
         elif isinstance(pool, MLATokenToKVPool):
             draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
         else:
