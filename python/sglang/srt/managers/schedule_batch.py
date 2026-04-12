@@ -248,12 +248,6 @@ class MultimodalDataItem:
     # Model-specific data stored in a dictionary
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
 
-    # Shared memory handle for zero-copy mmap transport.
-    # Excluded from pickle via __getstate__.
-    _shm_handle: Any = dataclasses.field(
-        default=None, init=False, repr=False, compare=False
-    )
-
     def __getattr__(self, name: str):
         if (
             "model_specific_data" in self.__dict__
@@ -273,25 +267,6 @@ class MultimodalDataItem:
 
     def set(self, key: str, value: Any):
         self.__setitem__(key, value)
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        state.pop("_shm_handle", None)
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self._shm_handle = None
-
-    def release_shm(self):
-        """Release the POSIX shared memory handle if held."""
-        if self._shm_handle is not None:
-            self._shm_handle.close()
-            try:
-                self._shm_handle.unlink()
-            except FileNotFoundError:
-                pass  # Another rank already unlinked
-            self._shm_handle = None
 
     @staticmethod
     def is_empty_list(l):
@@ -461,9 +436,8 @@ class MultimodalInputs:
     mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
 
     def release_features(self):
-        """Release feature tensors and shared memory handles."""
+        """Release feature tensors to free GPU memory."""
         for item in self.mm_items:
-            item.release_shm()
             item.feature = None
 
     @staticmethod
@@ -1294,21 +1268,10 @@ class Req(ReqDllmMixin):
             self.extend_input_len,
         )
 
-    def release_multimodal_inputs(self, keep_for_session: bool = True):
-        """Release multimodal features and any attached shm handles."""
-        if self.multimodal_inputs is None:
-            return
-        if keep_for_session and self.session is not None:
-            return
-        self.multimodal_inputs.release_features()
-        self.multimodal_inputs = None
-
     def set_finish_with_abort(self, error_msg: str):
         if get_tensor_model_parallel_rank() == 0:
             logger.error(f"{error_msg}, {self.rid=}")
-        # Session-backed mm_inputs are shared across turns and get released
-        # when the session closes.
-        self.release_multimodal_inputs()
+        self.multimodal_inputs = None
         self.grammar = None
         self.origin_input_ids = [0]  # set it to one token to skip the long prefill
         self.return_logprob = False

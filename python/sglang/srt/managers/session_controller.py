@@ -232,11 +232,6 @@ class Session:
             time_stats=req.time_stats,
         )
         if last_req is not None:
-            # TODO: Streaming sessions currently transfer multimodal_inputs by
-            # reference from the previous request to the new request. Once the
-            # previous request is detached from the session below, its cleanup
-            # path becomes the normal non-session one, so overlapping request
-            # lifecycles could still make this ownership transfer fragile.
             new_req.multimodal_inputs = last_req.multimodal_inputs
         new_req.tokenizer = tokenizer
 
@@ -244,14 +239,6 @@ class Session:
             new_req.set_finish_with_abort(abort_message)
         elif self.streaming:
             if last_req is not None:
-                if last_req.multimodal_inputs is not None:
-                    logger.warning(
-                        "Streaming session %s is reusing multimodal_inputs from req %s to req %s; "
-                        "this shared ownership may be unsafe if request lifecycles overlap.",
-                        self.session_id,
-                        last_req.rid,
-                        req.rid,
-                    )
                 last_req.session = None
             self.req_nodes[req.rid] = SessionReqNode(new_req)
         else:
