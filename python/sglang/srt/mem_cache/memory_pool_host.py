@@ -75,8 +75,6 @@ def synchronized(func):
 
 
 class HostTensorAllocator(abc.ABC):
-    supports_cuda_batch_memcpy = True
-
     def __init__(self):
         """Initialize the HostTensorAllocator."""
         self.dtype = None
@@ -489,7 +487,6 @@ class MHATokenToKVPoolHost(HostKVCache):
                     dst_indices=device_indices,
                     layer_id=layer_id,
                     page_size=self.page_size,
-                    use_batch_memcpy=False,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -599,7 +596,6 @@ class MHATokenToKVPoolHost(HostKVCache):
                     src_indices=device_indices,
                     dst_indices=host_indices,
                     page_size=self.page_size,
-                    use_batch_memcpy=False,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -983,7 +979,6 @@ class MLATokenToKVPoolHost(HostKVCache):
                     dst_indices=device_indices,
                     layer_id=layer_id,
                     page_size=self.page_size,
-                    use_batch_memcpy=False,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -1071,7 +1066,6 @@ class MLATokenToKVPoolHost(HostKVCache):
                     src_indices=device_indices,
                     dst_indices=host_indices,
                     page_size=self.page_size,
-                    use_batch_memcpy=False,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -1991,7 +1985,6 @@ class NSAIndexerPoolHost(HostKVCache):
                     dst_indices=device_page_indices,
                     layer_id=layer_id,
                     page_size=1,
-                    use_batch_memcpy=False,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -2043,7 +2036,6 @@ class NSAIndexerPoolHost(HostKVCache):
                     src_indices=device_page_indices,
                     dst_indices=host_page_indices,
                     page_size=1,
-                    use_batch_memcpy=False,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")

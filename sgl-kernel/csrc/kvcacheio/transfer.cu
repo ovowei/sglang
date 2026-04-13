@@ -739,8 +739,7 @@ inline void transfer_kv_page_first_direct_impl(
     const at::Tensor& src_indices,
     const at::Tensor& dst_indices,
     int64_t start_layer_id,
-    int64_t page_size,
-    bool use_batch_memcpy = true) {
+    int64_t page_size) {
   TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
   TORCH_CHECK(page_size > 0, "Page size must be positive");
   TORCH_CHECK(src_indices.numel() % page_size == 0, "Source indices size must be divisible by page size");
@@ -798,13 +797,6 @@ inline void transfer_kv_page_first_direct_impl(
   return;
 
 #else
-  // Caller-requested fallback: some host memory allocators (e.g. Mooncake) are
-  // incompatible with cudaMemcpyBatchAsync due to a CUDA driver bug.
-  if (!use_batch_memcpy) {
-    fallback_to_page_copy();
-    return;
-  }
-
   // Driver capability gate: only use cudaMemcpyBatchAsync on CUDA 12.8+ drivers.
   int driver_version = 0;
   cudaError_t driver_version_err = cudaDriverGetVersion(&driver_version);
@@ -952,9 +944,8 @@ void transfer_kv_per_layer_direct_pf_lf(
     const at::Tensor& src_indices,
     const at::Tensor& dst_indices,
     int64_t layer_id,
-    int64_t page_size,
-    bool use_batch_memcpy) {
-  transfer_kv_page_first_direct_impl<false>(src_ptrs, dst_ptrs, src_indices, dst_indices, layer_id, page_size, use_batch_memcpy);
+    int64_t page_size) {
+  transfer_kv_page_first_direct_impl<false>(src_ptrs, dst_ptrs, src_indices, dst_indices, layer_id, page_size);
 }
 
 void transfer_kv_all_layer_direct_lf_pf(
@@ -962,7 +953,6 @@ void transfer_kv_all_layer_direct_lf_pf(
     std::vector<at::Tensor> dst_ptrs,
     const at::Tensor& src_indices,
     const at::Tensor& dst_indices,
-    int64_t page_size,
-    bool use_batch_memcpy) {
-  transfer_kv_page_first_direct_impl<true>(src_ptrs, dst_ptrs, src_indices, dst_indices, 0, page_size, use_batch_memcpy);
+    int64_t page_size) {
+  transfer_kv_page_first_direct_impl<true>(src_ptrs, dst_ptrs, src_indices, dst_indices, 0, page_size);
 }
