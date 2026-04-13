@@ -460,7 +460,7 @@ class Envs:
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
     SGLANG_USE_IPC_POOL_HANDLE_CACHE = EnvBool(False)
-    SGLANG_MM_FEATURE_CACHE_MB = EnvInt(1024)
+    SGLANG_MM_FEATURE_CACHE_MB = EnvInt(1 * 1024)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
     # When 1, distribute uvicorn tokenizer workers across visible CUDA devices
     # by rewriting CUDA_VISIBLE_DEVICES per-worker before spawn. Mirrors the
