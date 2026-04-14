@@ -199,6 +199,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""
+        # GLM does not support tool_choice='required', downgrade to 'auto'
+        if self.is_glm and isinstance(request.tool_choice, str) and request.tool_choice.lower() == "required":
+            logger.warning("tool_choice='required' is being downgraded to 'auto' for GLM model.")
+            request.tool_choice = "auto"
+
         if not request.messages:
             return "Messages cannot be empty."
 
