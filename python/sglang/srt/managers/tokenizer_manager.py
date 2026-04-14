@@ -871,7 +871,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     f"{max_new_tokens} tokens for the completion. Please reduce the number "
                     f"of tokens in the input messages or the completion to fit within the limit."
                 )
-                raise PayloadTooLargeError(error_msg)
+                if "glm" in self.model_path.lower():
+                    raise PayloadTooLargeError(error_msg)
+                raise ValueError(error_msg)
 
         # Validate embedding requests
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
