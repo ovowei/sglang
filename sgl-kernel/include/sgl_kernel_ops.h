@@ -568,16 +568,14 @@ void transfer_kv_per_layer_direct_pf_lf(
     const at::Tensor& src_indices,
     const at::Tensor& dst_indices,
     int64_t layer_id,
-    int64_t page_size,
-    bool use_batch_memcpy);
+    int64_t page_size);
 
 void transfer_kv_all_layer_direct_lf_pf(
     const std::vector<at::Tensor>& src_ptrs,
     std::vector<at::Tensor> dst_ptrs,
     const at::Tensor& src_indices,
     const at::Tensor& dst_indices,
-    int64_t page_size,
-    bool use_batch_memcpy);
+    int64_t page_size);
 
 /*
  * From csrc/memory
