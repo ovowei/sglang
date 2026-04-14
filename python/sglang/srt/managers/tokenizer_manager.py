@@ -120,6 +120,12 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
+
+
+class PayloadTooLargeError(Exception):
+    """Exception raised when request payload exceeds the maximum context length."""
+    pass
+
 logger = logging.getLogger(__name__)
 
 _INCREMENTAL_STREAMING_META_INFO_KEYS = (
@@ -865,7 +871,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     f"{max_new_tokens} tokens for the completion. Please reduce the number "
                     f"of tokens in the input messages or the completion to fit within the limit."
                 )
-                raise ValueError(error_msg)
+                raise PayloadTooLargeError(error_msg)
 
         # Validate embedding requests
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:

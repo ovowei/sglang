@@ -14,6 +14,7 @@ from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
+from sglang.srt.managers.tokenizer_manager import PayloadTooLargeError
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -116,6 +117,12 @@ class OpenAIServingBase(ABC):
                 message=str(e),
                 err_type="BadRequest",
                 status_code=400,
+            )
+        except PayloadTooLargeError as e:
+            return self.create_error_response(
+                message=str(e),
+                err_type="PayloadTooLargeError",
+                status_code=413,
             )
         except DS32EncodingError as e:
             logger.info(f"DS32EncodingError: {e}")

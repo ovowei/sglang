@@ -140,7 +140,6 @@ class UsageInfo(BaseModel):
     completion_tokens: Optional[int] = 0
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
-    reasoning_tokens: Optional[int] = 0
     completion_tokens_details: Optional[CompletionTokensDetails] = None
 
 
@@ -683,6 +682,18 @@ class ChatCompletionRequest(BaseModel):
             else:
                 values["tool_choice"] = "auto"
         return values
+
+    @model_validator(mode="before")
+    @classmethod
+    def downgrade_required_tool_choice(cls, values):
+        tool_choice = values.get("tool_choice")
+        if isinstance(tool_choice, str) and tool_choice.lower() == "required":
+            logger.warning(
+                "tool_choice='required' is being downgraded to 'auto'."
+            )
+            values["tool_choice"] = "auto"
+        return values
+
 
     @model_validator(mode="before")
     @classmethod
