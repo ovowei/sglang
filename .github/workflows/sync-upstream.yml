@@ -1,0 +1,27 @@
+name: Sync sglang-upstream
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # 每天北京时间 10:00
+  workflow_dispatch:      # 支持手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: sglang-upstream
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch upstream and force push
+        run: |
+          git remote add upstream https://github.com/sgl-project/sglang.git
+          git fetch upstream main
+          git reset --hard upstream/main
+          git push origin sglang-upstream --force
+          echo "Synced to $(git rev-parse --short HEAD)"
