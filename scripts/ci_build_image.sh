@@ -40,7 +40,7 @@ if [ "$REBUILD_KERNEL" = true ]; then
     cd /sgl-workspace/sglang/sgl-kernel &&
     TORCH_CUDA_ARCH_LIST='10.0' \
     CMAKE_BUILD_PARALLEL_LEVEL=32 \
-    NVCC_THREADS=2 \
+    CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=4" \
     pip install -e . --no-build-isolation
   "
 fi
