@@ -38,7 +38,10 @@ if [ "$REBUILD_KERNEL" = true ]; then
   echo "[CI] Recompiling sgl-kernel..."
   docker exec $CID bash -c "
     cd /sgl-workspace/sglang/sgl-kernel &&
-    TORCH_CUDA_ARCH_LIST='10.0' pip install -e . --no-build-isolation
+    TORCH_CUDA_ARCH_LIST='10.0' \
+    CMAKE_BUILD_PARALLEL_LEVEL=32 \
+    NVCC_THREADS=2 \
+    pip install -e . --no-build-isolation
   "
 fi
 
