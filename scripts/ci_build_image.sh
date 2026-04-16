@@ -7,7 +7,7 @@ CACHE_TARBALL=/mnt/data/wjh/image-cache/root_cache.tar.gz
 INITIAL_BASE=$REGISTRY/sglang:v0.5.10_glm51_0415_cudaMemCopy_content_list
 
 # 检测 kernel 是否变动
-if git -C $REPO_PATH diff HEAD~1 --name-only | grep -q "^sgl-kernel/"; then
+if false; then  # kernel rebuild disabled - requires network access not available in CI
   REBUILD_KERNEL=true
   if docker pull $REGISTRY/sglang:kernel-base 2>/dev/null; then
     BASE_IMAGE=$REGISTRY/sglang:kernel-base
