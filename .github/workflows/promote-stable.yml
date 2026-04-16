@@ -6,7 +6,7 @@ on:
 
 jobs:
   promote:
-    runs-on: [self-hosted, b300]
+    runs-on: [self-hosted, cpu-builder]
     env:
       RUNNER_ALLOW_RUNASROOT: "1"
     steps:

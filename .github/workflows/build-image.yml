@@ -6,7 +6,7 @@ on:
 
 jobs:
   build:
-    runs-on: [self-hosted, b300]
+    runs-on: [self-hosted, cpu-builder]
     timeout-minutes: 60
     env:
       RUNNER_ALLOW_RUNASROOT: "1"
