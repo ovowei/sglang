@@ -26,7 +26,7 @@ else
 fi
 
 # 启动临时容器
-CID=$(docker run -d $BASE_IMAGE sleep infinity)
+CID=$(docker run -d --entrypoint "" $BASE_IMAGE sleep infinity)
 trap "docker stop $CID 2>/dev/null || true" EXIT
 
 # 替换代码
