@@ -1,0 +1,22 @@
+name: Build Dev Image
+
+on:
+  push:
+    branches: [dev]
+
+jobs:
+  build:
+    runs-on: [self-hosted, b300]
+    timeout-minutes: 60
+    env:
+      RUNNER_ALLOW_RUNASROOT: "1"
+    steps:
+      - name: Sync code to NFS
+        run: |
+          cd /mnt/data/wjh/sglang-taas
+          git fetch origin
+          git checkout dev
+          git reset --hard origin/dev
+
+      - name: Build and push image
+        run: bash /mnt/data/wjh/sglang-taas/scripts/ci_build_image.sh

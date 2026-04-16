@@ -1,0 +1,19 @@
+name: Promote to Stable
+
+on:
+  push:
+    branches: [online-image]
+
+jobs:
+  promote:
+    runs-on: [self-hosted, b300]
+    env:
+      RUNNER_ALLOW_RUNASROOT: "1"
+    steps:
+      - name: Retag dev -> stable
+        run: |
+          docker pull 10.12.11.7:16622/sglang:dev
+          docker tag  10.12.11.7:16622/sglang:dev \
+                      10.12.11.7:16622/sglang:stable
+          docker push 10.12.11.7:16622/sglang:stable
+          echo "Promoted dev -> stable"
