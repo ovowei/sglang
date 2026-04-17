@@ -34,7 +34,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    build_nsa_hybrid_stack,
+    build_radix_hybrid_stack,
 )
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -80,7 +80,7 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         elif isinstance(self.kv_cache, NSATokenToKVPool):
-            # Filled by build_nsa_hybrid_stack after storage extra_config is parsed.
+            # Filled by build_radix_hybrid_stack after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
@@ -95,6 +95,9 @@ class HiRadixCache(RadixCache):
             raise ValueError(
                 "HiRadixCache only supports MHA, MLA, and NSA (DSA) models"
             )
+
+        self.draft_kv_pool_host = None
+        self.draft_indexer_pool_host = None
 
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
@@ -120,8 +123,10 @@ class HiRadixCache(RadixCache):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
-        if isinstance(self.kv_cache, NSATokenToKVPool):
-            build_nsa_hybrid_stack(
+        if isinstance(self.kv_cache, NSATokenToKVPool) or (
+            params.draft_token_to_kv_pool is not None
+        ):
+            build_radix_hybrid_stack(
                 self,
                 params,
                 server_args,
@@ -636,14 +641,29 @@ class HiRadixCache(RadixCache):
     def _get_extra_pools(self) -> dict:
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
+        pools = []
         if isinstance(self.kv_cache, NSATokenToKVPool):
-            pool = PoolTransfer(
-                name=PoolName.INDEXER,
-                hit_policy=PoolHitPolicy.ALL_PAGES,
+            pools.append(
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
+                )
             )
-            return {"extra_pools": [pool]}
-        else:
-            return {}
+        if self.draft_kv_pool_host is not None:
+            pools.append(
+                PoolTransfer(
+                    name=PoolName.DRAFT,
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
+                )
+            )
+        if self.draft_indexer_pool_host is not None:
+            pools.append(
+                PoolTransfer(
+                    name=PoolName.DRAFT_INDEXER,
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
+                )
+            )
+        return {"extra_pools": pools} if pools else {}
 
     def clear_storage_backend(self) -> bool:
         if self.enable_storage:
