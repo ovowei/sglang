@@ -11,7 +11,7 @@ concurrency:
 jobs:
   build:
     runs-on: [self-hosted, cpu-builder]
-    timeout-minutes: 60
+    timeout-minutes: 180
     env:
       RUNNER_ALLOW_RUNASROOT: "1"
     steps:
