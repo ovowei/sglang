@@ -451,6 +451,28 @@ def kv_to_page_num(num_kv_indices: int, page_size: int):
     return (num_kv_indices + page_size - 1) // page_size
 
 
+def get_local_range_for_rank(
+    total_items: int,
+    rank: int,
+    world_size: int,
+) -> slice:
+    """Return the contiguous local [start, end) range for a rank."""
+    if world_size <= 1:
+        return slice(0, total_items)
+
+    base = total_items // world_size
+    rem = total_items % world_size
+
+    if rem == 0:
+        start = rank * base
+        end = start + base
+    else:
+        start = rank * base + min(rank, rem)
+        end = start + base + (1 if rank < rem else 0)
+
+    return slice(start, end)
+
+
 def page_indices_to_cp_rank_page_indices(
     page_indices: np.ndarray,
     total_pages: int,
@@ -478,16 +500,9 @@ def page_indices_to_cp_rank_page_indices(
         return np.asarray(page_indices)
 
     first_page = int(page_indices.min())
-    base = total_pages // cp_size
-    rem = total_pages % cp_size
-
-    if rem == 0:
-        local_start = cp_rank * base
-        local_end = local_start + base
-    else:
-        local_start = cp_rank * base + min(cp_rank, rem)
-        n_pages = base + (1 if cp_rank < rem else 0)
-        local_end = local_start + n_pages
+    local_range = get_local_range_for_rank(total_pages, cp_rank, cp_size)
+    local_start = local_range.start
+    local_end = local_range.stop
 
     # Map back to global page ids.
     start_page = first_page + local_start
@@ -495,6 +510,33 @@ def page_indices_to_cp_rank_page_indices(
 
     mask = (page_indices >= start_page) & (page_indices < end_page)
     return np.asarray(page_indices)[mask]
+
+
+def filter_indices_by_position_for_cp_rank(
+    indices: np.ndarray | list[int],
+    cp_rank: int,
+    cp_size: int,
+    index_slice: Optional[slice] = None,
+) -> Tuple[np.ndarray, slice]:
+    """Filter aligned indices by logical position instead of page-id value.
+
+    This is used for transfer side data like NSA/SWA state indices whose
+    physical page ids may be non-contiguous even though their logical order
+    still matches between prefill and decode.
+    """
+    indices = np.asarray(indices)
+    base_start = (
+        0 if index_slice is None or index_slice.start is None else index_slice.start
+    )
+
+    if indices.size == 0 or cp_size <= 1:
+        return indices, slice(base_start, base_start + len(indices))
+
+    local_range = get_local_range_for_rank(len(indices), cp_rank, cp_size)
+    return indices[local_range], slice(
+        base_start + local_range.start,
+        base_start + local_range.stop,
+    )
 
 
 def filter_kv_indices_for_cp_rank(

@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    filter_indices_by_position_for_cp_rank,
     filter_kv_indices_for_cp_rank,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
@@ -59,6 +60,7 @@ class TransferKVChunk:
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List[int]]
+    state_index_slice: Optional[slice]
 
 
 from sglang.srt.disaggregation.common.staging_handler import (
@@ -996,11 +998,18 @@ class MooncakeKVManager(CommonKVManager):
         req: TransferInfo,
         prefill_state_indices: list[int],
         dst_state_data_ptrs: list[int],
+        dst_state_indices: Optional[list[int]],
         executor: concurrent.futures.ThreadPoolExecutor,
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
     ):
         """Send state or extra pool data with type-specific handling."""
         state_type = getattr(self.kv_args, "state_type", "none")
+        dst_state_indices = (
+            req.dst_state_indices if dst_state_indices is None else dst_state_indices
+        )
+
+        if len(prefill_state_indices) == 0 or len(dst_state_indices) == 0:
+            return 0
 
         if state_type == "mamba":
             # Check if we need slice transfer for different TP sizes
@@ -1012,6 +1021,7 @@ class MooncakeKVManager(CommonKVManager):
                     req,
                     prefill_state_indices,
                     dst_state_data_ptrs,
+                    dst_state_indices,
                     target_rank_registration_info.dst_state_item_lens,
                     target_rank_registration_info.dst_state_dim_per_tensor,
                     target_rank_registration_info.dst_tp_rank,
@@ -1022,6 +1032,7 @@ class MooncakeKVManager(CommonKVManager):
                     req,
                     prefill_state_indices,
                     dst_state_data_ptrs,
+                    dst_state_indices,
                 )
         elif state_type in ["swa", "nsa"]:
             logger.debug(
@@ -1036,16 +1047,16 @@ class MooncakeKVManager(CommonKVManager):
                 raise RuntimeError(
                     f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {state_type.upper()} hybrid models yet."
                 )
-            if len(prefill_state_indices) < len(req.dst_state_indices):
+            if len(prefill_state_indices) > len(dst_state_indices):
                 logger.warning(
-                    f"len(prefill_state_indices) = {len(prefill_state_indices)}, len(dst_state_indices) = {len(req.dst_state_indices)}"
+                    f"len(prefill_state_indices) = {len(prefill_state_indices)}, len(dst_state_indices) = {len(dst_state_indices)}"
                 )
                 prefill_state_indices = prefill_state_indices[
-                    : len(req.dst_state_indices)
+                    : len(dst_state_indices)
                 ]
             # Reuse _send_kvcache_generic interface to send extra pool data
             prefill_state_indices = np.array(prefill_state_indices, dtype=np.int32)
-            dst_state_indices = np.array(req.dst_state_indices, dtype=np.int32)
+            dst_state_indices = np.array(dst_state_indices, dtype=np.int32)
             return self._send_kvcache_generic(
                 is_mla_backend=self.is_mla_backend,
                 mooncake_session_id=req.mooncake_session_id,
@@ -1064,9 +1075,11 @@ class MooncakeKVManager(CommonKVManager):
         req: TransferInfo,
         prefill_mamba_index: list[int],
         dst_state_data_ptrs: list[int],
+        dst_state_indices: list[int],
     ):
         """Transfer Mamba states."""
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
+        assert len(dst_state_indices) == 1, "Mamba should have single destination state index"
 
         transfer_blocks = []
         prefill_state_data_ptrs = self.kv_args.state_data_ptrs
@@ -1075,7 +1088,7 @@ class MooncakeKVManager(CommonKVManager):
         for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
             length = prefill_state_item_lens[i]
             src_addr = prefill_state_data_ptrs[i] + length * int(prefill_mamba_index[0])
-            dst_addr = dst_state_ptr + length * int(req.dst_state_indices[0])
+            dst_addr = dst_state_ptr + length * int(dst_state_indices[0])
             transfer_blocks.append((src_addr, dst_addr, length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
@@ -1085,6 +1098,7 @@ class MooncakeKVManager(CommonKVManager):
         req: TransferInfo,
         prefill_mamba_index: list[int],
         dst_state_data_ptrs: list[int],
+        dst_state_indices: list[int],
         dst_state_item_lens: list[int],
         dst_state_dim_per_tensor: list[int],
         dst_tp_rank: int,
@@ -1113,7 +1127,12 @@ class MooncakeKVManager(CommonKVManager):
 
         # If no dimension info available, fall back to regular transfer
         if not src_state_dim_per_tensor or not dst_state_dim_per_tensor:
-            return self._send_mamba_state(req, prefill_mamba_index, dst_state_data_ptrs)
+            return self._send_mamba_state(
+                req,
+                prefill_mamba_index,
+                dst_state_data_ptrs,
+                dst_state_indices,
+            )
 
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
@@ -1158,7 +1177,7 @@ class MooncakeKVManager(CommonKVManager):
             )
             dst_addr = (
                 dst_state_ptr
-                + dst_item_len * int(req.dst_state_indices[0])
+                + dst_item_len * int(dst_state_indices[0])
                 + dst_dim_offset
             )
 
@@ -1425,11 +1444,18 @@ class MooncakeKVManager(CommonKVManager):
                                     state_type != "nsa"
                                     or target_rank_registration_info.is_send_target
                                 ):  # only nsa care abort is_need_send_target flag
+                                    dst_state_indices = req.dst_state_indices
+                                    if kv_chunk.state_index_slice is not None:
+                                        dst_state_indices = dst_state_indices[
+                                            kv_chunk.state_index_slice
+                                        ]
                                     self.maybe_send_extra(
                                         req,
                                         kv_chunk.state_indices,
                                         target_rank_registration_info.dst_state_data_ptrs,
+                                        dst_state_indices,
                                         executor,
+                                        target_rank_registration_info,
                                     )
 
                             # Only the last chunk we need to send the aux data
@@ -1694,6 +1720,7 @@ class MooncakeKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        state_index_slice: Optional[slice] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -1728,6 +1755,7 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                state_index_slice=state_index_slice,
             )
         )
 
@@ -1786,6 +1814,7 @@ class MooncakeKVSender(CommonKVSender):
         state_indices: Optional[List[int]] = None,
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
+        state_index_slice = None
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
@@ -1796,6 +1825,12 @@ class MooncakeKVSender(CommonKVSender):
                 kv_indices,
                 index_slice,
             )
+            if is_last_chunk and state_indices is not None:
+                state_indices, state_index_slice = filter_indices_by_position_for_cp_rank(
+                    state_indices,
+                    cp_rank=self.kv_mgr.attn_cp_rank,
+                    cp_size=self.kv_mgr.attn_cp_size,
+                )
         elif self.kv_mgr.is_dummy_cp_rank:
             if not is_last_chunk:
                 return
@@ -1818,6 +1853,7 @@ class MooncakeKVSender(CommonKVSender):
                 True,
                 aux_index=self.aux_index,
                 state_indices=state_indices,
+                state_index_slice=state_index_slice,
             )
 
     def poll(self) -> KVPoll:

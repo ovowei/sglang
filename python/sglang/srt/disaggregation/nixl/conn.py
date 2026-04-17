@@ -22,6 +22,7 @@ from sglang.srt.disaggregation.common.conn import (
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    filter_indices_by_position_for_cp_rank,
     filter_kv_indices_for_cp_rank,
 )
 from sglang.srt.environ import envs
@@ -684,6 +685,9 @@ class NixlKVManager(CommonKVManager):
         """Send state or extra pool data with type-specific handling."""
         state_type = getattr(self.kv_args, "state_type", "none")
 
+        if len(prefill_state_indices) == 0 or len(dst_state_indices) == 0:
+            return None
+
         if state_type == "mamba":
             if self.attn_tp_size != decode_tp_size:
                 raise RuntimeError(
@@ -733,6 +737,7 @@ class NixlKVManager(CommonKVManager):
         chunk_id: int,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        state_index_slice: Optional[slice] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
@@ -783,11 +788,14 @@ class NixlKVManager(CommonKVManager):
             if is_last:
                 if state_indices is not None:
                     dst_info = self.decode_kv_args_table[req.agent_name]
+                    dst_state_indices = req.dst_state_indices
+                    if state_index_slice is not None:
+                        dst_state_indices = dst_state_indices[state_index_slice]
                     state_xfer_handle = self.maybe_send_extra(
                         req.agent_name,
                         state_indices,
                         dst_info.dst_state_data_ptrs,
-                        req.dst_state_indices,
+                        dst_state_indices,
                         dst_info.gpu_id,
                         f"{req.room}_state_{self.kv_args.pp_rank}",
                         decode_tp_size,
@@ -905,6 +913,7 @@ class NixlKVSender(CommonKVSender):
         state_indices: Optional[List[int]] = None,
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
+        state_index_slice = None
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
 
@@ -915,6 +924,12 @@ class NixlKVSender(CommonKVSender):
                 kv_indices,
                 index_slice,
             )
+            if is_last and state_indices is not None:
+                state_indices, state_index_slice = filter_indices_by_position_for_cp_rank(
+                    state_indices,
+                    cp_rank=self.kv_mgr.attn_cp_rank,
+                    cp_size=self.kv_mgr.attn_cp_size,
+                )
         elif self.kv_mgr.is_dummy_cp_rank:
             if not is_last:
                 return
@@ -930,6 +945,7 @@ class NixlKVSender(CommonKVSender):
             self.chunk_id,
             self.aux_index,
             state_indices,
+            state_index_slice,
         )
         self.xfer_handles.extend(new_xfer_handles)
         self.chunk_id += 1
