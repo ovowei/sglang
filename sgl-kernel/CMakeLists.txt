@@ -567,3 +567,4 @@ install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernel
         PATTERN "__pycache__" EXCLUDE)
 # ci trigger
 # ci trigger 2
+# trigger kernel rebuild
