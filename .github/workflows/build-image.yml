@@ -4,6 +4,10 @@ on:
   push:
     branches: [dev]
 
+concurrency:
+  group: build-dev
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: [self-hosted, cpu-builder]

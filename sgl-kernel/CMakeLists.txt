@@ -570,3 +570,4 @@ install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernel
 # trigger kernel rebuild
 # trigger
 # ci test
+# retrigger
