@@ -6,6 +6,8 @@ REPO_PATH=/mnt/data/wjh/sglang-taas
 CACHE_TARBALL=/mnt/data/wjh/image-cache/root_cache.tar.gz
 INITIAL_BASE=$REGISTRY/sglang:v0.5.10_glm51_0415_cudaMemCopy_content_list
 FETCHCONTENT_CACHE=/mnt/afs/sglang-taas/fetchcontent-cache
+FLASHMLA_DIR=/mnt/afs/sglang-taas/3rdparty/FlashMLA
+FLASHMLA_COMMIT=e1c0028077c83bf9561ce2b1eafdb8165a596351
 
 # 检测 kernel 是否变动
 if git -C $REPO_PATH diff --name-only HEAD~1 HEAD -- sgl-kernel/ | grep -q .; then
@@ -29,9 +31,24 @@ fi
 # 确保 FetchContent cache 目录存在
 mkdir -p $FETCHCONTENT_CACHE
 
-# 启动临时容器，挂载 FetchContent cache
+# 确保 FlashMLA 本地 clone 存在且在正确 commit
+if [ ! -d "$FLASHMLA_DIR/.git" ]; then
+  echo "[CI] Cloning FlashMLA..."
+  mkdir -p $(dirname $FLASHMLA_DIR)
+  https_proxy=http://127.0.0.1:21683 git clone https://github.com/deepseek-ai/FlashMLA.git $FLASHMLA_DIR
+fi
+CURRENT=$(git -C $FLASHMLA_DIR rev-parse HEAD 2>/dev/null || echo "none")
+if [ "$CURRENT" != "$FLASHMLA_COMMIT" ]; then
+  echo "[CI] Updating FlashMLA to $FLASHMLA_COMMIT..."
+  https_proxy=http://127.0.0.1:21683 git -C $FLASHMLA_DIR fetch origin
+  git -C $FLASHMLA_DIR checkout $FLASHMLA_COMMIT
+fi
+echo "[CI] FlashMLA at $(git -C $FLASHMLA_DIR rev-parse --short HEAD)"
+
+# 启动临时容器，挂载 FetchContent cache 和 FlashMLA
 CID=$(docker run -d --network host --entrypoint "" \
   -v $FETCHCONTENT_CACHE:/mnt/afs/fetchcontent-cache \
+  -v $FLASHMLA_DIR:/sgl-workspace/sglang/3rdparty/FlashMLA:ro \
   $BASE_IMAGE sleep infinity)
 trap "docker stop $CID 2>/dev/null || true" EXIT
 
