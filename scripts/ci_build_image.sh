@@ -7,7 +7,7 @@ CACHE_TARBALL=/mnt/data/wjh/image-cache/root_cache.tar.gz
 INITIAL_BASE=$REGISTRY/sglang:v0.5.10_glm51_0415_cudaMemCopy_content_list
 FETCHCONTENT_CACHE=/mnt/afs/sglang-taas/fetchcontent-cache
 FLASHMLA_DIR=/mnt/afs/sglang-taas/3rdparty/FlashMLA
-FLASHMLA_COMMIT=e1c0028077c83bf9561ce2b1eafdb8165a596351
+FLASHMLA_COMMIT=abb54777d4e08c8054c238f59889b52d4e9f0896
 
 # 检测 kernel 是否变动
 if git -C $REPO_PATH diff --name-only HEAD~1 HEAD -- sgl-kernel/ | grep -q .; then
