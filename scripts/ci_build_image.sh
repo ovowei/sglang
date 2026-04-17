@@ -65,8 +65,8 @@ if [ "$REBUILD_KERNEL" = true ]; then
     cd /sgl-workspace/sglang/sgl-kernel &&
     TORCH_CUDA_ARCH_LIST='10.0' \
     make build \
-      MAX_JOBS=2 \
-      CMAKE_BUILD_PARALLEL_LEVEL=2 \
+      MAX_JOBS=16 \
+      CMAKE_BUILD_PARALLEL_LEVEL=16 \
       'CMAKE_ARGS=-DSGL_KERNEL_COMPILE_THREADS=1 -DFETCHCONTENT_BASE_DIR=/mnt/afs/fetchcontent-cache'
   "
 fi
