@@ -396,9 +396,6 @@ class Scheduler(
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
 
-        # Register draft KV pool (when spec + HiCache co-enabled).
-        self._maybe_register_hicache_draft()
-
         # Init running status
         self.init_running_status()
 
@@ -757,6 +754,11 @@ class Scheduler(
         if self.model_config.is_multimodal and uses_transformers_backend:
             effective_chunked_prefill_size = None
 
+        # Get draft KV pool for HiCache hybrid stack (spec + hicache).
+        draft_kv_pool = None
+        if self.enable_hierarchical_cache:
+            draft_kv_pool, _ = self._get_draft_kv_pool()
+
         params = CacheInitParams(
             disable=self.disable_radix_cache,
             req_to_token_pool=self.req_to_token_pool,
@@ -776,8 +778,11 @@ class Scheduler(
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            attn_cp_rank=self.attn_cp_rank,
+            attn_cp_size=self.attn_cp_size,
             chunked_prefill_size=effective_chunked_prefill_size,
             sliding_window_size=self.sliding_window_size,
+            draft_token_to_kv_pool=draft_kv_pool,
         )
 
         if effective_chunked_prefill_size is not None and self.disable_radix_cache:
@@ -880,51 +885,6 @@ class Scheduler(
             self.draft_worker.model_runner.token_to_kv_pool,
             self.draft_worker.model_config,
         )
-
-    def _maybe_register_hicache_draft(self) -> None:
-        """Register draft KV pool with HiCacheController for piggyback L2/L3 ops."""
-        if not self.enable_hierarchical_cache:
-            return
-
-        draft_kv_pool, _ = self._get_draft_kv_pool()
-        if draft_kv_pool is None:
-            return
-
-        from sglang.srt.mem_cache.memory_pool import (
-            HybridLinearKVPool,
-            MHATokenToKVPool,
-            MLATokenToKVPool,
-        )
-        from sglang.srt.mem_cache.memory_pool_host import (
-            MHATokenToKVPoolHost,
-            MLATokenToKVPoolHost,
-        )
-
-        pool = draft_kv_pool
-        if isinstance(pool, HybridLinearKVPool):
-            pool = pool.full_kv_pool
-
-        # Create host pool for draft with the same slot count as the target host pool,
-        # so that host indices stay 1-to-1 between target and draft KV caches.
-        primary = self.tree_cache.cache_controller.mem_pool_host
-        kw = dict(
-            host_to_device_ratio=primary.size / pool.size,
-            host_size=0,
-            page_size=self.page_size,
-            layout=self.server_args.hicache_mem_layout,
-        )
-        if isinstance(pool, MHATokenToKVPool):
-            draft_host_pool = MHATokenToKVPoolHost(pool, **kw)
-        elif isinstance(pool, MLATokenToKVPool):
-            draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
-        else:
-            logger.warning(
-                "Draft pool type %s not supported for HiCache, skipping.",
-                type(pool).__name__,
-            )
-            return
-
-        self.tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
