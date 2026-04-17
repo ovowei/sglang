@@ -35,7 +35,7 @@ mkdir -p $FETCHCONTENT_CACHE
 if [ ! -d "$FLASHMLA_DIR/.git" ]; then
   echo "[CI] Cloning FlashMLA..."
   mkdir -p $(dirname $FLASHMLA_DIR)
-  https_proxy=http://127.0.0.1:21683 git clone https://github.com/deepseek-ai/FlashMLA.git $FLASHMLA_DIR
+  https_proxy=http://127.0.0.1:21683 git clone https://github.com/sgl-project/FlashMLA.git $FLASHMLA_DIR
 fi
 CURRENT=$(git -C $FLASHMLA_DIR rev-parse HEAD 2>/dev/null || echo "none")
 if [ "$CURRENT" != "$FLASHMLA_COMMIT" ]; then
