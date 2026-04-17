@@ -52,8 +52,8 @@ CID=$(docker run -d --network host --entrypoint "" \
   $BASE_IMAGE sleep infinity)
 trap "docker stop $CID 2>/dev/null || true" EXIT
 
-# 替换代码
-docker exec $CID rm -rf /sgl-workspace/sglang
+# 替换代码（保留 3rdparty 挂载目录不删）
+docker exec $CID bash -c "find /sgl-workspace/sglang -mindepth 1 -maxdepth 1 -not -name '3rdparty' | xargs rm -rf"
 docker cp $REPO_PATH/. $CID:/sgl-workspace/sglang
 
 # 重编 kernel（慢速路径）
