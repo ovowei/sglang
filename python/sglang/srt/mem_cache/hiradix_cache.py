@@ -1281,7 +1281,7 @@ class HiRadixCache(RadixCache):
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
-        key, _ = self.maybe_bigram_convert(key)
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=empty_value,
@@ -1468,7 +1468,7 @@ class HiRadixCache(RadixCache):
 
         if priority is None:
             priority = 0
-        key, value = self.maybe_bigram_convert(key, value)
+        key, value = key.maybe_to_bigram_view(self.is_eagle, value)
 
         if len(key) == 0:
             return InsertResult(prefix_len=0)
