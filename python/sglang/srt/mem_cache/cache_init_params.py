@@ -32,9 +32,17 @@ class CacheInitParams:
     pp_rank: int = 0
     pp_size: int = 1
 
+    attn_cp_rank: int = 0
+    attn_cp_size: int = 1
+
     chunked_prefill_size: Optional[int] = None
 
     sliding_window_size: Optional[int] = None
+
+    # Draft KV pool for speculative decoding (EAGLE/EAGLE3/standalone).
+    # When set, HiRadixCache will build a HybridCacheController with the
+    # draft pool as a sidecar so that draft KV participates in L2/L3 ops.
+    draft_token_to_kv_pool: Optional[object] = None
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None

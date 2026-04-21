@@ -20,7 +20,12 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostTensorAllocator
+from sglang.srt.mem_cache.memory_pool_host import (
+    HostKVCache,
+    HostTensorAllocator,
+    MHATokenToKVPoolHost,
+    MLATokenToKVPoolHost,
+)
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
@@ -524,13 +529,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, page_keys: List[str], transfer: PoolTransfer
     ) -> Tuple[List[str], int]:
         # A logical "page" may map to multiple physical objects in storage.
-        # - INDEXER: one key per page
-        # - MAMBA  : one temporal key + N conv keys per page
+        # - INDEXER / DRAFT_INDEXER: one key per page
+        # - DRAFT                 : one or more KV objects per page
+        # - MAMBA                 : one temporal key + N conv keys per page
         # key_multiplier records how many component keys are generated per page.
         name = transfer.name
         suffixes = []
-        if name == PoolName.INDEXER:
-            suffixes = [f"_{self.mla_suffix}_{PoolName.INDEXER}"]
+        if name in (PoolName.INDEXER, PoolName.DRAFT_INDEXER):
+            suffixes = [f"_{self.mla_suffix}_{name.value}"]
         elif name == PoolName.MAMBA:
             pools = getattr(self, "registered_pools", {})
             mamba_pool = pools.get(PoolName.MAMBA)
@@ -539,6 +545,29 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             suffixes = [f"{base_suffix}_temporal"] + [
                 f"{base_suffix}_conv_{i}" for i in range(conv_num)
             ]
+        elif name == PoolName.DRAFT:
+            draft_pool = getattr(self, "registered_pools", {}).get(PoolName.DRAFT)
+            if isinstance(draft_pool, MHATokenToKVPoolHost):
+                if (
+                    self.storage_config.should_split_heads
+                    and draft_pool.layout == "page_head"
+                ):
+                    for suffix in self.mha_suffix:
+                        suffixes.extend(
+                            [f"_{suffix}_{name.value}_k", f"_{suffix}_{name.value}_v"]
+                        )
+                else:
+                    suffixes = [
+                        f"_{self.mha_suffix}_{name.value}_k",
+                        f"_{self.mha_suffix}_{name.value}_v",
+                    ]
+            elif isinstance(draft_pool, MLATokenToKVPoolHost):
+                suffixes = [f"_{self.mla_suffix}_{name.value}_k"]
+            else:
+                raise ValueError(
+                    f"Unsupported draft pool for Mooncake: {type(draft_pool).__name__}"
+                )
+
         key_multiplier = len(suffixes)
         component_keys = [
             f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
@@ -607,10 +636,26 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             assert len(keys) > 0
             assert len(keys) == len(host_indices) // page_size
 
-            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
+            if (
+                transfer.name == PoolName.DRAFT
+                and self.storage_config.should_split_heads
+                and isinstance(host_pool, MHATokenToKVPoolHost)
+                and host_pool.layout == "page_head"
+            ):
+                ptr_list, element_size_list = (
+                    host_pool.get_split_heads_page_buffer_meta(
+                        host_indices, self.split_factor
+                    )
+                )
+            else:
+                ptr_list, element_size_list = host_pool.get_page_buffer_meta(
+                    host_indices
+                )
+
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )
+            assert len(key_strs) == len(ptr_list)
             key_strs = self._tag_keys(key_strs)
 
             if is_set:

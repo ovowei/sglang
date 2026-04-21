@@ -256,6 +256,10 @@ class HostKVCache(abc.ABC):
         """
         raise NotImplementedError()
 
+    def get_hybrid_pool_buffer(self):
+        """Return tensors that storage backends must register for zero-copy I/O."""
+        return [self.kv_buffer]
+
     @synchronized
     def clear(self):
         # Initialize memory states and tracking structures.
