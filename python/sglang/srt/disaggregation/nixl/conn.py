@@ -22,7 +22,6 @@ from sglang.srt.disaggregation.common.conn import (
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
-    filter_indices_by_position_for_cp_rank,
     filter_kv_indices_for_cp_rank,
 )
 from sglang.srt.environ import envs
@@ -737,7 +736,6 @@ class NixlKVManager(CommonKVManager):
         chunk_id: int,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
-        state_index_slice: Optional[slice] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
@@ -788,14 +786,11 @@ class NixlKVManager(CommonKVManager):
             if is_last:
                 if state_indices is not None:
                     dst_info = self.decode_kv_args_table[req.agent_name]
-                    dst_state_indices = req.dst_state_indices
-                    if state_index_slice is not None:
-                        dst_state_indices = dst_state_indices[state_index_slice]
                     state_xfer_handle = self.maybe_send_extra(
                         req.agent_name,
                         state_indices,
                         dst_info.dst_state_data_ptrs,
-                        dst_state_indices,
+                        req.dst_state_indices,
                         dst_info.gpu_id,
                         f"{req.room}_state_{self.kv_args.pp_rank}",
                         decode_tp_size,
@@ -913,23 +908,29 @@ class NixlKVSender(CommonKVSender):
         state_indices: Optional[List[int]] = None,
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
-        state_index_slice = None
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
 
         # Special handling for cp
+        # NOTE: CP state-indices sharding is currently implemented only for the
+        # mooncake transfer backend (see mooncake/conn.py transfer_worker). With
+        # nixl + AC=on, kv_indices are sharded per CP rank but state_indices
+        # are still sent in full from each CP rank. Correct (same payload to
+        # same dst) but wastes outgoing bandwidth.
+        #
+        # Rationale for NOT re-introducing the previous position-based sharding
+        # here: that logic was shown on mooncake to misalign src/dst under
+        # NSA + round-robin-split CP and caused accuracy regressions. Until
+        # the per-pool page-value filter is ported to nixl, this backend
+        # trades outgoing bandwidth for correctness — intentional. Do NOT
+        # restore position-based sharding as a bandwidth optimization without
+        # porting the page-value filter at the same time.
         if self.kv_mgr.enable_all_cp_ranks_for_transfer:
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
                 self.kv_mgr,
                 kv_indices,
                 index_slice,
             )
-            if is_last and state_indices is not None:
-                state_indices, state_index_slice = filter_indices_by_position_for_cp_rank(
-                    state_indices,
-                    cp_rank=self.kv_mgr.attn_cp_rank,
-                    cp_size=self.kv_mgr.attn_cp_size,
-                )
         elif self.kv_mgr.is_dummy_cp_rank:
             if not is_last:
                 return
@@ -945,7 +946,6 @@ class NixlKVSender(CommonKVSender):
             self.chunk_id,
             self.aux_index,
             state_indices,
-            state_index_slice,
         )
         self.xfer_handles.extend(new_xfer_handles)
         self.chunk_id += 1
