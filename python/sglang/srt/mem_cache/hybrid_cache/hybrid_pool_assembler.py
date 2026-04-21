@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
+import torch
+
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -39,6 +41,7 @@ def _build_attention_host_pool(
     page_size: int,
     layout: str,
     allocator_type: Optional[str],
+    shared_memory_name: Optional[str] = None,
 ):
     common_kw = dict(
         host_to_device_ratio=host_to_device_ratio,
@@ -51,10 +54,14 @@ def _build_attention_host_pool(
             pool,
             **common_kw,
             allocator_type=allocator_type,
+            shared_memory_name=shared_memory_name,
             override_kv_cache_dim=pool.kv_cache_dim,
         )
     if isinstance(pool, MLATokenToKVPool):
-        return MLATokenToKVPoolHost(pool, **common_kw, allocator_type=allocator_type)
+        return MLATokenToKVPoolHost(
+            pool, **common_kw, allocator_type=allocator_type,
+            shared_memory_name=shared_memory_name,
+        )
     if isinstance(pool, MHATokenToKVPool):
         return MHATokenToKVPoolHost(pool, **common_kw, allocator_type=allocator_type)
     raise ValueError(f"Attention pool type {type(pool).__name__} not supported")
@@ -69,12 +76,14 @@ def _append_nsa_indexer_entry(
     layout: str,
     allocator_type: Optional[str],
     layer_mapper,
+    shared_memory_name: Optional[str] = None,
 ) -> NSAIndexerPoolHost:
     indexer_host = NSAIndexerPoolHost(
         pool,
         anchor_host,
         layout,
         allocator_type=allocator_type,
+        shared_memory_name=shared_memory_name,
     )
 
     entries.append(
@@ -98,21 +107,37 @@ def build_radix_hybrid_stack(
     prefetch_threshold: int,
     enable_storage_metrics: bool,
     load_cache_event,
+    enable_shared_l2: bool = False,
+    shared_memory_name: Optional[str] = None,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
     """HostPoolGroup + HybridCacheController for NSA and/or speculative draft."""
     try:
         kv = radix_cache.kv_cache
+        allocator_type = (
+            "share_memory" if enable_shared_l2 else server_args.hicache_storage_backend
+        )
+        _shared_names: list[str] = []
         layer_num = kv.layer_num
 
         # --- KV anchor host pool ---
         if isinstance(kv, NSATokenToKVPool):
+            kv_shared_memory_name = (
+                f"{shared_memory_name}_kv"
+                if enable_shared_l2 and shared_memory_name
+                else None
+            )
+            if kv_shared_memory_name:
+                _shared_names.append(f"kv={kv_shared_memory_name}")
             kv_host = _build_attention_host_pool(
                 kv,
                 host_to_device_ratio=server_args.hicache_ratio,
                 host_size=server_args.hicache_size,
                 page_size=radix_cache.page_size,
                 layout=server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
+                allocator_type=allocator_type,
+                shared_memory_name=kv_shared_memory_name,
             )
         else:
             # MHA / MLA: already created by HiRadixCache.__init__
@@ -135,14 +160,22 @@ def build_radix_hybrid_stack(
 
         # --- NSA/DSA indexer sidecar ---
         if isinstance(kv, NSATokenToKVPool):
+            indexer_shared_memory_name = (
+                f"{shared_memory_name}_indexer"
+                if enable_shared_l2 and shared_memory_name
+                else None
+            )
+            if indexer_shared_memory_name:
+                _shared_names.append(f"indexer={indexer_shared_memory_name}")
             _append_nsa_indexer_entry(
                 entries,
                 name=PoolName.INDEXER,
                 pool=kv,
                 anchor_host=kv_host,
                 layout=server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
+                allocator_type=allocator_type,
                 layer_mapper=layer_mapper,
+                shared_memory_name=indexer_shared_memory_name,
             )
 
         # --- Speculative draft KV sidecar ---
@@ -152,13 +185,21 @@ def build_radix_hybrid_stack(
             if isinstance(draft_pool, HybridLinearKVPool):
                 draft_pool = draft_pool.full_kv_pool
 
+            draft_kv_shared_memory_name = (
+                f"{shared_memory_name}_draft_kv"
+                if enable_shared_l2 and shared_memory_name
+                else None
+            )
+            if draft_kv_shared_memory_name:
+                _shared_names.append(f"draft_kv={draft_kv_shared_memory_name}")
             draft_host = _build_attention_host_pool(
                 draft_pool,
                 host_to_device_ratio=kv_host.size / draft_pool.size,
                 host_size=0,
                 page_size=radix_cache.page_size,
                 layout=server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
+                allocator_type=allocator_type,
+                shared_memory_name=draft_kv_shared_memory_name,
             )
 
             draft_layer_num = draft_pool.layer_num
@@ -181,16 +222,32 @@ def build_radix_hybrid_stack(
 
             radix_cache.draft_kv_pool_host = draft_host
             if isinstance(draft_pool, NSATokenToKVPool):
+                draft_indexer_shared_memory_name = (
+                    f"{shared_memory_name}_draft_indexer"
+                    if enable_shared_l2 and shared_memory_name
+                    else None
+                )
+                if draft_indexer_shared_memory_name:
+                    _shared_names.append(
+                        f"draft_indexer={draft_indexer_shared_memory_name}"
+                    )
                 draft_indexer_host = _append_nsa_indexer_entry(
                     entries,
                     name=PoolName.DRAFT_INDEXER,
                     pool=draft_pool,
                     anchor_host=draft_host,
                     layout=server_args.hicache_mem_layout,
-                    allocator_type=server_args.hicache_storage_backend,
+                    allocator_type=allocator_type,
                     layer_mapper=draft_layer_mapper,
+                    shared_memory_name=draft_indexer_shared_memory_name,
                 )
                 radix_cache.draft_indexer_pool_host = draft_indexer_host
+
+        if _shared_names:
+            logger.info(
+                "Using experimental shared CUDA L2 HiCache path (%s).",
+                ", ".join(_shared_names),
+            )
 
         host_pool_group = HostPoolGroup(entries)
         cache_controller = HybridCacheController(
@@ -213,6 +270,9 @@ def build_radix_hybrid_stack(
             attn_cp_size=params.attn_cp_size,
             transfer_layer_num=transfer_layer_num,
             enable_storage_metrics=enable_storage_metrics,
+            attn_cp_group=attn_cp_group,
+            attn_tp_group=attn_tp_group,
+            enable_shared_l2=enable_shared_l2,
         )
         radix_cache.full_kv_pool_host = kv_host
         radix_cache.token_to_kv_pool_host = host_pool_group

@@ -103,6 +103,25 @@ def get_allocator_from_storage(allocator_type):
                 "Fallback to use default allocator."
             )
             return HostTensorAllocator()
+    elif allocator_type == "share_memory":
+        from sglang.srt.layers.dp_attention import (
+            get_attention_cp_group,
+            get_attention_cp_rank,
+            get_attention_tp_group,
+            get_attention_tp_rank,
+        )
+        from sglang.srt.mem_cache.shared_mla_hicache import (
+            SharedMemoryHostTensorAllocator,
+        )
+
+        allocator = SharedMemoryHostTensorAllocator()
+        attn_cp_group = get_attention_cp_group()
+        attn_tp_group = get_attention_tp_group()
+        allocator.attn_cp_group = getattr(attn_cp_group, "cpu_group", attn_cp_group)
+        allocator.attn_tp_group = getattr(attn_tp_group, "cpu_group", attn_tp_group)
+        allocator.attn_cp_rank = get_attention_cp_rank()
+        allocator.attn_tp_rank = get_attention_tp_rank()
+        return allocator
     else:
         return HostTensorAllocator()
 
@@ -113,12 +132,56 @@ def alloc_with_host_register(
     device: str,
     pin_memory: bool,
     allocator: HostTensorAllocator,
+    shared_memory_name: Optional[str] = None,
 ) -> torch.Tensor:
     """
     Allocate tensor and register host memory with cudaHostRegister.
     CudaHostRegister only applies when pin_memory=True.
     """
-    buffer = allocator.allocate(dims, dtype=dtype, device=device)
+    from sglang.srt.mem_cache.shared_mla_hicache import (
+        SharedMemoryHostTensorAllocator,
+    )
+    if isinstance(allocator, SharedMemoryHostTensorAllocator):
+        assert shared_memory_name is not None
+        attn_cp_group = getattr(allocator, "attn_cp_group")
+        attn_tp_group = getattr(allocator, "attn_tp_group")
+        attn_cp_rank = getattr(allocator, "attn_cp_rank")
+        attn_tp_rank = getattr(allocator, "attn_tp_rank")
+        is_creator = attn_cp_rank == 0 and attn_tp_rank == 0
+        if is_creator:
+            buffer = allocator.allocate(
+                dims,
+                dtype=dtype,
+                device=device,
+                shared_memory_name=shared_memory_name,
+                create=True,
+            )
+        else:
+            buffer = None
+
+        if (
+            attn_tp_rank == 0
+            and attn_cp_group is not None
+            and torch.distributed.get_world_size(group=attn_cp_group) > 1
+        ):
+            torch.distributed.barrier(group=attn_cp_group)
+
+        if (
+            attn_tp_group is not None
+            and torch.distributed.get_world_size(group=attn_tp_group) > 1
+        ):
+            torch.distributed.barrier(group=attn_tp_group)
+
+        if not is_creator:
+            buffer = allocator.allocate(
+                dims,
+                dtype=dtype,
+                device=device,
+                shared_memory_name=shared_memory_name,
+                create=False,
+            )
+    else:
+        buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
         torch.cuda.cudart().cudaHostRegister(
             buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
@@ -800,9 +863,11 @@ class MLATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        shared_memory_name: Optional[str] = None,
         override_kv_cache_dim: Optional[int] = None,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
+        self.shared_memory_name = shared_memory_name
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -915,13 +980,23 @@ class MLATokenToKVPoolHost(HostKVCache):
         self.layout_dim = self.token_stride_size * self.layer_num
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
-        buffer = alloc_func(
-            dims,
-            dtype=self.dtype,
-            device=self.device,
-            pin_memory=self.pin_memory,
-            allocator=self.allocator,
-        )
+        if self.shared_memory_name is not None:
+            buffer = alloc_func(
+                dims,
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+                shared_memory_name=self.shared_memory_name,
+            )
+        else:
+            buffer = alloc_func(
+                dims,
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
         return buffer
 
     def load_to_device_per_layer(
@@ -1822,6 +1897,7 @@ class NSAIndexerPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        shared_memory_name: Optional[str] = None,
     ):
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
@@ -1829,6 +1905,7 @@ class NSAIndexerPoolHost(HostKVCache):
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
+        self.shared_memory_name = shared_memory_name
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
@@ -1889,13 +1966,28 @@ class NSAIndexerPoolHost(HostKVCache):
             device=self.device_pool.device,
         )
         if self.layout == "layer_first":
-            self.index_k_with_scale_buffer = alloc_func(
-                (self.layer_num, self.indexer_page_num, self.indexer_page_stride_size),
-                dtype=self.indexer_dtype,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                allocator=self.allocator,
+            dims = (
+                self.layer_num,
+                self.indexer_page_num,
+                self.indexer_page_stride_size,
             )
+            if self.shared_memory_name is not None:
+                self.index_k_with_scale_buffer = alloc_func(
+                    dims,
+                    dtype=self.indexer_dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                    shared_memory_name=self.shared_memory_name,
+                )
+            else:
+                self.index_k_with_scale_buffer = alloc_func(
+                    dims,
+                    dtype=self.indexer_dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
             self.index_k_data_refs = [
                 self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
             ]
@@ -1905,18 +1997,29 @@ class NSAIndexerPoolHost(HostKVCache):
                 device=self.device_pool.device,
             )
         elif self.layout in ["page_first", "page_first_direct"]:
-            self.index_k_with_scale_buffer = alloc_func(
-                (
-                    self.indexer_page_num,
-                    self.layer_num,
-                    1,
-                    self.indexer_page_stride_size,
-                ),
-                dtype=self.indexer_dtype,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                allocator=self.allocator,
+            dims = (
+                self.indexer_page_num,
+                self.layer_num,
+                1,
+                self.indexer_page_stride_size,
             )
+            if self.shared_memory_name is not None:
+                self.index_k_with_scale_buffer = alloc_func(
+                    dims,
+                    dtype=self.indexer_dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                    shared_memory_name=self.shared_memory_name,
+                )
+            else:
+                self.index_k_with_scale_buffer = alloc_func(
+                    dims,
+                    dtype=self.indexer_dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 

@@ -52,6 +52,10 @@ from sglang.srt.mem_cache.radix_cache import (
     compute_node_hash_values,
     split_node_hash_value,
 )
+from sglang.srt.mem_cache.shared_mla_hicache import (
+    get_shared_cuda_mla_l2_name,
+    should_enable_shared_cuda_mla_l2,
+)
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 
@@ -69,6 +73,17 @@ class HiRadixCache(RadixCache):
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
+        self.use_shared_cuda_l2 = should_enable_shared_cuda_mla_l2(
+            self.kv_cache,
+            params.attn_cp_cache_group,
+            params.attn_tp_cache_group,
+            draft_kv_cache=params.draft_token_to_kv_pool,
+        )
+        self.shared_cuda_l2_name = (
+            get_shared_cuda_mla_l2_name(params.pp_rank)
+            if self.use_shared_cuda_l2
+            else None
+        )
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
@@ -83,13 +98,24 @@ class HiRadixCache(RadixCache):
             # Filled by build_radix_hybrid_stack after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
+            if self.use_shared_cuda_l2:
+                logger.info(
+                    "Using experimental shared CUDA MLA L2 HiCache path "
+                    "(shared host allocator, name=%s).",
+                    self.shared_cuda_l2_name,
+                )
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
+                allocator_type=(
+                    "share_memory"
+                    if self.use_shared_cuda_l2
+                    else server_args.hicache_storage_backend
+                ),
+                shared_memory_name=self.shared_cuda_l2_name,
             )
         else:
             raise ValueError(
@@ -134,6 +160,10 @@ class HiRadixCache(RadixCache):
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
                 load_cache_event=self.load_cache_event,
+                enable_shared_l2=self.use_shared_cuda_l2,
+                shared_memory_name=self.shared_cuda_l2_name,
+                attn_cp_group=self.attn_cp_group,
+                attn_tp_group=self.attn_tp_group,
             )
         else:
             self.cache_controller = HiCacheController(
@@ -153,6 +183,7 @@ class HiRadixCache(RadixCache):
                 pp_rank=self.pp_rank,
                 pp_size=self.pp_size,
                 enable_storage_metrics=self.enable_storage_metrics,
+                enable_shared_l2=self.use_shared_cuda_l2,
             )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
