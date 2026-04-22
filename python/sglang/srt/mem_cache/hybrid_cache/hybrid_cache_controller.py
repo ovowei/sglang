@@ -171,6 +171,8 @@ class HybridCacheController(BaseHiCacheController):
         attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
         attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
         enable_shared_l2: bool = False,
+        is_shared_l2_numa_leader: bool = False,
+        is_shared_l2_attn_leader: bool = False,
     ):
         startup_storage_backend = storage_backend
         super().__init__(
@@ -193,6 +195,8 @@ class HybridCacheController(BaseHiCacheController):
             attn_cp_size=attn_cp_size,
             enable_storage_metrics=enable_storage_metrics,
             enable_shared_l2=enable_shared_l2,
+            is_shared_l2_numa_leader=is_shared_l2_numa_leader,
+            is_shared_l2_attn_leader=is_shared_l2_attn_leader,
         )
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
@@ -224,7 +228,7 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
         )
 
-        if self._is_shared_l2_storage_leader():
+        if not self.enable_shared_l2 or self.is_shared_l2_numa_leader:
             for entry in host_pools or []:
                 self.storage_backend.register_mem_host_pool_v2(
                     entry.host_pool, entry.name
@@ -279,7 +283,7 @@ class HybridCacheController(BaseHiCacheController):
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
-            if not self.enable_shared_l2 or self._is_shared_l2_storage_leader():
+            if not self.enable_shared_l2 or self.is_shared_l2_numa_leader:
                 self.mem_pool_host.backup_from_device_all_layer(
                     self.mem_pool_device,
                     host_indices,

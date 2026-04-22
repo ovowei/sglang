@@ -109,6 +109,8 @@ def build_radix_hybrid_stack(
     load_cache_event,
     enable_shared_l2: bool = False,
     shared_memory_name: Optional[str] = None,
+    is_shared_l2_numa_leader: bool = False,
+    is_shared_l2_attn_leader: bool = False,
     attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
@@ -273,6 +275,8 @@ def build_radix_hybrid_stack(
             attn_cp_group=attn_cp_group,
             attn_tp_group=attn_tp_group,
             enable_shared_l2=enable_shared_l2,
+            is_shared_l2_numa_leader=is_shared_l2_numa_leader,
+            is_shared_l2_attn_leader=is_shared_l2_attn_leader,
         )
         radix_cache.full_kv_pool_host = kv_host
         radix_cache.token_to_kv_pool_host = host_pool_group

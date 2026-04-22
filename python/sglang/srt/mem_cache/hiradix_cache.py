@@ -54,6 +54,7 @@ from sglang.srt.mem_cache.radix_cache import (
 )
 from sglang.srt.mem_cache.shared_mla_hicache import (
     get_shared_cuda_mla_l2_name,
+    get_shared_cuda_mla_l2_rank_info,
     should_enable_shared_cuda_mla_l2,
 )
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
@@ -79,8 +80,23 @@ class HiRadixCache(RadixCache):
             params.attn_tp_cache_group,
             draft_kv_cache=params.draft_token_to_kv_pool,
         )
+        self.shared_cuda_l2_rank_info = (
+            get_shared_cuda_mla_l2_rank_info(
+                params.attn_cp_cache_group,
+                params.attn_tp_cache_group,
+            )
+            if self.use_shared_cuda_l2
+            else {
+                "numa_node": -1,
+                "is_shared_l2_numa_leader": False,
+                "is_shared_l2_attn_leader": False,
+            }
+        )
         self.shared_cuda_l2_name = (
-            get_shared_cuda_mla_l2_name(params.pp_rank)
+            get_shared_cuda_mla_l2_name(
+                params.pp_rank,
+                self.shared_cuda_l2_rank_info["numa_node"],
+            )
             if self.use_shared_cuda_l2
             else None
         )
@@ -101,8 +117,12 @@ class HiRadixCache(RadixCache):
             if self.use_shared_cuda_l2:
                 logger.info(
                     "Using experimental shared CUDA MLA L2 HiCache path "
-                    "(shared host allocator, name=%s).",
+                    "(shared host allocator, name=%s, numa_node=%s, "
+                    "shared_l2_numa_leader=%s, shared_l2_attn_leader=%s).",
                     self.shared_cuda_l2_name,
+                    self.shared_cuda_l2_rank_info["numa_node"],
+                    self.shared_cuda_l2_rank_info["is_shared_l2_numa_leader"],
+                    self.shared_cuda_l2_rank_info["is_shared_l2_attn_leader"],
                 )
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
@@ -162,6 +182,12 @@ class HiRadixCache(RadixCache):
                 load_cache_event=self.load_cache_event,
                 enable_shared_l2=self.use_shared_cuda_l2,
                 shared_memory_name=self.shared_cuda_l2_name,
+                is_shared_l2_numa_leader=self.shared_cuda_l2_rank_info[
+                    "is_shared_l2_numa_leader"
+                ],
+                is_shared_l2_attn_leader=self.shared_cuda_l2_rank_info[
+                    "is_shared_l2_attn_leader"
+                ],
                 attn_cp_group=self.attn_cp_group,
                 attn_tp_group=self.attn_tp_group,
             )
@@ -184,6 +210,12 @@ class HiRadixCache(RadixCache):
                 pp_size=self.pp_size,
                 enable_storage_metrics=self.enable_storage_metrics,
                 enable_shared_l2=self.use_shared_cuda_l2,
+                is_shared_l2_numa_leader=self.shared_cuda_l2_rank_info[
+                    "is_shared_l2_numa_leader"
+                ],
+                is_shared_l2_attn_leader=self.shared_cuda_l2_rank_info[
+                    "is_shared_l2_attn_leader"
+                ],
             )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,

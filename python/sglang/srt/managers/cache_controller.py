@@ -268,6 +268,8 @@ class HiCacheController:
         attn_cp_size: int = 1,
         enable_storage_metrics: bool = False,
         enable_shared_l2: bool = False,
+        is_shared_l2_numa_leader: bool = False,
+        is_shared_l2_attn_leader: bool = False,
     ):
         self.tp_group = tp_group
         self.attn_cp_group = attn_cp_group
@@ -293,6 +295,8 @@ class HiCacheController:
         self.attn_cp_size = attn_cp_size
         self.enable_storage_metrics = enable_storage_metrics
         self.enable_shared_l2 = enable_shared_l2
+        self.is_shared_l2_numa_leader = is_shared_l2_numa_leader
+        self.is_shared_l2_attn_leader = is_shared_l2_attn_leader
         self.attn_tp_rank = get_attention_tp_rank()
 
         # Default storage page IO functions (may be overridden by attach).
@@ -404,12 +408,6 @@ class HiCacheController:
             if group is None:
                 continue
             torch.distributed.all_reduce(tensor, op=op, group=group)
-
-    def _is_shared_l2_storage_leader(self) -> bool:
-        return (
-            not self.enable_shared_l2
-            or (self.attn_cp_rank == 0 and self.attn_tp_rank == 0)
-        )
 
     def _broadcast_shared_l2_object(self, obj, caller: str):
         groups = self.prefetch_sync_groups[caller]
@@ -534,7 +532,7 @@ class HiCacheController:
         )
         # for MLA models, only one rank needs to backup the KV cache
         if self.enable_shared_l2:
-            self.backup_skip = not self._is_shared_l2_storage_leader()
+            self.backup_skip = not self.is_shared_l2_attn_leader
         else:
             self.backup_skip = (
                 self.storage_config.is_mla_model
@@ -549,7 +547,10 @@ class HiCacheController:
             self.storage_backend = StorageBackendFactory.create_backend(
                 storage_backend, self.storage_config, self.mem_pool_host
             )
-            if self._is_shared_l2_storage_leader():
+            if (
+                not self.enable_shared_l2
+                or self.is_shared_l2_numa_leader
+            ):
                 self.storage_backend.register_mem_pool_host(self.mem_pool_host)
 
             self.enable_storage = True
@@ -773,7 +774,7 @@ class HiCacheController:
             start_event.wait(self.write_stream)
             if (
                 not self.enable_shared_l2
-                or self._is_shared_l2_storage_leader()
+                or self.is_shared_l2_numa_leader
             ):
                 self.mem_pool_host.backup_from_device_all_layer(
                     self.mem_pool_device, host_indices, device_indices, self.io_backend
@@ -979,13 +980,27 @@ class HiCacheController:
                 if operation is None:
                     continue
                 if self.enable_shared_l2:
-                    if self._is_shared_l2_storage_leader():
+                    if self.is_shared_l2_numa_leader:
                         self._page_transfer(operation)
-                    completed_tokens = self._broadcast_shared_l2_object(
-                        operation.completed_tokens, "prefetch_io_aux_func"
+                    completed_tokens = (
+                        operation.completed_tokens
+                        if self.is_shared_l2_numa_leader
+                        else len(operation.hash_value) * self.page_size
                     )
-                    operation.completed_tokens = completed_tokens
-                    if completed_tokens != len(operation.hash_value) * self.page_size:
+                    completed_tokens_tensor = torch.tensor(
+                        completed_tokens,
+                        dtype=torch.int,
+                    )
+                    self._all_reduce_prefetch_groups(
+                        completed_tokens_tensor,
+                        torch.distributed.ReduceOp.MIN,
+                        "prefetch_io_aux_func",
+                    )
+                    operation.completed_tokens = completed_tokens_tensor.item()
+                    if (
+                        operation.completed_tokens
+                        != len(operation.hash_value) * self.page_size
+                    ):
                         operation.mark_terminate()
                 else:
                     self._page_transfer(operation)
@@ -1053,7 +1068,7 @@ class HiCacheController:
                 if operation is None:
                     continue
                 if self.enable_shared_l2:
-                    if self._is_shared_l2_storage_leader():
+                    if self.is_shared_l2_attn_leader:
                         hash_value, _ = self._storage_hit_query(operation)
                     else:
                         hash_value = []

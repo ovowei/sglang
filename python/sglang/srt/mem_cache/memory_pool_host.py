@@ -111,6 +111,7 @@ def get_allocator_from_storage(allocator_type):
             get_attention_tp_rank,
         )
         from sglang.srt.mem_cache.shared_mla_hicache import (
+            get_shared_cuda_mla_l2_rank_info,
             SharedMemoryHostTensorAllocator,
         )
 
@@ -121,6 +122,14 @@ def get_allocator_from_storage(allocator_type):
         allocator.attn_tp_group = getattr(attn_tp_group, "cpu_group", attn_tp_group)
         allocator.attn_cp_rank = get_attention_cp_rank()
         allocator.attn_tp_rank = get_attention_tp_rank()
+        rank_info = get_shared_cuda_mla_l2_rank_info(
+            allocator.attn_cp_group,
+            allocator.attn_tp_group,
+        )
+        allocator.l2_numa_node = rank_info["numa_node"]
+        allocator.is_shared_l2_numa_leader = rank_info[
+            "is_shared_l2_numa_leader"
+        ]
         return allocator
     else:
         return HostTensorAllocator()
@@ -147,7 +156,11 @@ def alloc_with_host_register(
         attn_tp_group = getattr(allocator, "attn_tp_group")
         attn_cp_rank = getattr(allocator, "attn_cp_rank")
         attn_tp_rank = getattr(allocator, "attn_tp_rank")
-        is_creator = attn_cp_rank == 0 and attn_tp_rank == 0
+        is_creator = getattr(
+            allocator,
+            "is_shared_l2_numa_leader",
+            attn_cp_rank == 0 and attn_tp_rank == 0,
+        )
         if is_creator:
             buffer = allocator.allocate(
                 dims,
@@ -155,6 +168,7 @@ def alloc_with_host_register(
                 device=device,
                 shared_memory_name=shared_memory_name,
                 create=True,
+                numa_node=getattr(allocator, "l2_numa_node", None),
             )
         else:
             buffer = None
