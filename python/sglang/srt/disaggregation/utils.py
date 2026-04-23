@@ -489,6 +489,16 @@ def page_indices_to_cp_rank_page_indices(
     range by first_page back into the global page id space and take
     the intersection with page_indices.
 
+    Invariant assumed: pages for a single request are allocated
+    contiguously in the global KV pool (i.e. page_indices values form
+    a dense [first_page, first_page + total_pages) interval, though they
+    may appear in any order within the array). This matches the
+    assumption used by filter_kv_indices_for_cp_rank for main-KV
+    sharding; state_indices for NSA are main-KV page ids produced by
+    kv_to_page_indices(req_to_token[:seq_len], page_size) and share
+    the same invariant. If a future allocator breaks contiguity,
+    both main-KV and state sharding must be revisited together.
+
     Returns:
         Subset of page_indices that fall in this rank's global
         [start_page, end_page) slice for the given CP rank.

@@ -9,7 +9,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -60,7 +60,6 @@ class TransferKVChunk:
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List[int]]
-    state_index_slice: Optional[slice]
 
 
 from sglang.srt.disaggregation.common.staging_handler import (
@@ -209,6 +208,11 @@ class MooncakeKVManager(CommonKVManager):
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        # Opt-in per-request transfer-layer timing/bytes stats. Emits one
+        # [pd-kv-xfer] log line per request on its last chunk.
+        self._xfer_stats_enabled = envs.SGLANG_DISAGG_TRANSFER_STATS.get()
+        self._xfer_stats: Dict[int, dict] = {}
+        self._xfer_stats_lock = threading.Lock()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -1047,7 +1051,7 @@ class MooncakeKVManager(CommonKVManager):
                 raise RuntimeError(
                     f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {state_type.upper()} hybrid models yet."
                 )
-            if len(prefill_state_indices) > len(dst_state_indices):
+            if len(prefill_state_indices) < len(dst_state_indices):
                 logger.warning(
                     f"len(prefill_state_indices) = {len(prefill_state_indices)}, len(dst_state_indices) = {len(dst_state_indices)}"
                 )
@@ -1325,6 +1329,12 @@ class MooncakeKVManager(CommonKVManager):
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
+                # Opt-in timing for [pd-kv-xfer] stats (env-gated to avoid log overhead).
+                _xs = self._xfer_stats_enabled
+                _xs_kv_ms = 0.0
+                _xs_state_ms = 0.0
+                _xs_aux_ms = 0.0
+                _xs_state_len = 0
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
                         # Early exit if the request has failed
@@ -1369,6 +1379,7 @@ class MooncakeKVManager(CommonKVManager):
 
                         # target
                         if target_rank_registration_info.is_send_target:
+                            _xs_t0 = time.perf_counter() if _xs else 0.0
                             ret, target_deferred = self._send_kv_cache(
                                 is_target=True,
                                 req=req,
@@ -1380,6 +1391,8 @@ class MooncakeKVManager(CommonKVManager):
                                 queue=queue,
                                 prefill_unique_rank=prefill_unique_rank,
                             )
+                            if _xs:
+                                _xs_kv_ms += (time.perf_counter() - _xs_t0) * 1000.0
                             if target_deferred:
                                 staging_deferred = True
                                 break
@@ -1444,26 +1457,75 @@ class MooncakeKVManager(CommonKVManager):
                                     state_type != "nsa"
                                     or target_rank_registration_info.is_send_target
                                 ):  # only nsa care abort is_need_send_target flag
+                                    src_state_indices = kv_chunk.state_indices
                                     dst_state_indices = req.dst_state_indices
-                                    if kv_chunk.state_index_slice is not None:
-                                        dst_state_indices = dst_state_indices[
-                                            kv_chunk.state_index_slice
-                                        ]
+                                    # Shard state_indices for CP: src and dst
+                                    # belong to independent pools, so each side
+                                    # is filtered against its own page-value
+                                    # range. NSA state indices are main-KV page
+                                    # ids (prefill: req_to_token[:seq_len] ->
+                                    # kv_to_page_indices; decode: same), so the
+                                    # same filter as main kv_indices applies.
+                                    # SWA/Mamba state layouts are not main-KV
+                                    # page ids; keep rank-0-only send for them.
+                                    if (
+                                        self.enable_all_cp_ranks_for_transfer
+                                        and self.attn_cp_size > 1
+                                    ):
+                                        if state_type == "nsa":
+                                            # NSA state_indices on src (prefill pool) and dst
+                                            # (decode pool) live in independent page-id spaces
+                                            # — the same logical token maps to different page
+                                            # ids on each side, and prefill pages may even be
+                                            # non-contiguous after allocator churn. What IS
+                                            # symmetric is array-position order: both sides
+                                            # build state_indices from
+                                            # kv_to_page_indices(req_to_token[:seq_len], page_size),
+                                            # so position i corresponds to the same logical
+                                            # page on both sides. Slice by position, not by
+                                            # page-id value.
+                                            src_state_indices, _ = (
+                                                filter_indices_by_position_for_cp_rank(
+                                                    src_state_indices,
+                                                    cp_rank=self.attn_cp_rank,
+                                                    cp_size=self.attn_cp_size,
+                                                )
+                                            )
+                                            dst_state_indices, _ = (
+                                                filter_indices_by_position_for_cp_rank(
+                                                    dst_state_indices,
+                                                    cp_rank=self.attn_cp_rank,
+                                                    cp_size=self.attn_cp_size,
+                                                )
+                                            )
+                                        elif state_type in ("swa", "mamba"):
+                                            if self.attn_cp_rank != 0:
+                                                src_state_indices = []
+                                                dst_state_indices = []
+                                    _xs_t0 = time.perf_counter() if _xs else 0.0
                                     self.maybe_send_extra(
                                         req,
-                                        kv_chunk.state_indices,
+                                        src_state_indices,
                                         target_rank_registration_info.dst_state_data_ptrs,
                                         dst_state_indices,
                                         executor,
                                         target_rank_registration_info,
                                     )
+                                    if _xs:
+                                        _xs_state_ms += (
+                                            time.perf_counter() - _xs_t0
+                                        ) * 1000.0
+                                        _xs_state_len = len(src_state_indices)
 
                             # Only the last chunk we need to send the aux data
+                            _xs_t0 = time.perf_counter() if _xs else 0.0
                             ret = self.send_aux(
                                 req,
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
+                            if _xs:
+                                _xs_aux_ms += (time.perf_counter() - _xs_t0) * 1000.0
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
@@ -1489,6 +1551,78 @@ class MooncakeKVManager(CommonKVManager):
 
                 if staging_deferred:
                     continue
+
+                # [pd-kv-xfer] stats: accumulate per-chunk timings per room;
+                # emit one line on the request's last chunk. Opt-in via
+                # SGLANG_DISAGG_TRANSFER_STATS; no overhead when disabled.
+                if _xs:
+                    try:
+                        num_dsts = sum(
+                            1 for r in reqs_to_be_processed if not r.is_dummy
+                        )
+                        if num_dsts == 0:
+                            # All-dummy chunk: nothing was actually sent, so
+                            # skip stats to avoid polluting bytes/chunk counts.
+                            pass
+                        else:
+                            kv_item_lens_sum = sum(self.kv_args.kv_item_lens)
+                            chunk_kv_bytes = (
+                                kv_item_lens_sum
+                                * len(kv_chunk.prefill_kv_indices)
+                                * num_dsts
+                            )
+                            log_snapshot = None
+                            with self._xfer_stats_lock:
+                                stats = self._xfer_stats.setdefault(
+                                    kv_chunk.room,
+                                    {"kv_ms": 0.0, "kv_bytes": 0, "chunks": 0},
+                                )
+                                stats["kv_ms"] += _xs_kv_ms
+                                stats["kv_bytes"] += chunk_kv_bytes
+                                stats["chunks"] += 1
+                                if kv_chunk.is_last_chunk:
+                                    state_item_lens_sum = sum(
+                                        getattr(self.kv_args, "state_item_lens", [])
+                                        or [0]
+                                    )
+                                    aux_item_lens_sum = sum(
+                                        getattr(self.kv_args, "aux_item_lens", [])
+                                        or [0]
+                                    )
+                                    state_bytes = (
+                                        state_item_lens_sum * _xs_state_len * num_dsts
+                                    )
+                                    aux_bytes = aux_item_lens_sum * num_dsts
+                                    log_snapshot = {
+                                        "room": kv_chunk.room,
+                                        "kv_chunks": stats["chunks"],
+                                        "kv_ms": stats["kv_ms"],
+                                        "kv_bytes": stats["kv_bytes"],
+                                        "num_dsts": num_dsts,
+                                        "state_ms": _xs_state_ms,
+                                        "state_bytes": state_bytes,
+                                        "state_indices_len": _xs_state_len,
+                                        "aux_ms": _xs_aux_ms,
+                                        "aux_bytes": aux_bytes,
+                                    }
+                                    self._xfer_stats.pop(kv_chunk.room, None)
+                            # Log outside the lock — I/O is not critical section.
+                            if log_snapshot is not None:
+                                logger.info(
+                                    f"[pd-kv-xfer] room={log_snapshot['room']} "
+                                    f"cp_rank={self.attn_cp_rank} "
+                                    f"n_dsts={log_snapshot['num_dsts']} "
+                                    f"kv_chunks={log_snapshot['kv_chunks']} "
+                                    f"kv_ms={log_snapshot['kv_ms']:.2f} "
+                                    f"kv_bytes={log_snapshot['kv_bytes']} "
+                                    f"state_ms={log_snapshot['state_ms']:.2f} "
+                                    f"state_bytes={log_snapshot['state_bytes']} "
+                                    f"state_indices_len={log_snapshot['state_indices_len']} "
+                                    f"aux_ms={log_snapshot['aux_ms']:.2f} "
+                                    f"aux_bytes={log_snapshot['aux_bytes']}"
+                                )
+                    except Exception as _xs_exc:
+                        logger.debug(f"[pd-kv-xfer] skipped: {_xs_exc!r}")
 
                 if (
                     kv_chunk.room not in self.request_status
@@ -1720,7 +1854,6 @@ class MooncakeKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
-        state_index_slice: Optional[slice] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -1755,7 +1888,6 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
-                state_index_slice=state_index_slice,
             )
         )
 
@@ -1814,23 +1946,18 @@ class MooncakeKVSender(CommonKVSender):
         state_indices: Optional[List[int]] = None,
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
-        state_index_slice = None
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
-        # Special handling for cp
+        # Special handling for cp: only kv_indices are sharded here. Sharding
+        # of state_indices happens later in transfer_worker, where both src
+        # and dst can be filtered against their own pool's page-value range.
         if self.kv_mgr.enable_all_cp_ranks_for_transfer:
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
                 self.kv_mgr,
                 kv_indices,
                 index_slice,
             )
-            if is_last_chunk and state_indices is not None:
-                state_indices, state_index_slice = filter_indices_by_position_for_cp_rank(
-                    state_indices,
-                    cp_rank=self.kv_mgr.attn_cp_rank,
-                    cp_size=self.kv_mgr.attn_cp_size,
-                )
         elif self.kv_mgr.is_dummy_cp_rank:
             if not is_last_chunk:
                 return
@@ -1853,7 +1980,6 @@ class MooncakeKVSender(CommonKVSender):
                 True,
                 aux_index=self.aux_index,
                 state_indices=state_indices,
-                state_index_slice=state_index_slice,
             )
 
     def poll(self) -> KVPoll:
