@@ -259,6 +259,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 user_value = getattr(request, param)
                 if user_value is not None and abs(user_value - expected_value) >= 1e-3:
                     return f"Parameter '{param}' cannot be overridden. Expected: {expected_value}, Got: {user_value}"
+            
+            user_temperature = getattr(request, "temperature") 
+            if user_temperature is not None and (user_temperature < 0.0 or user_temperature > 1.0):
+                return f"Parameter `temperature` must be in [0, 1.0]. Got: {user_temperature}"
 
         return None
 
@@ -266,7 +270,7 @@ class OpenAIServingChat(OpenAIServingBase):
     def _get_kimi_fixed_params(is_think_mode: bool) -> Dict[str, float]:
         """Return Kimi's fixed sampling parameters based on thinking mode."""
         return {
-            "temperature": 1.0 if is_think_mode else 0.6,
+            # "temperature": 1.0 if is_think_mode else 0.6,
             "top_p": 0.95,
             "presence_penalty": 0.0,
             "frequency_penalty": 0.0,
