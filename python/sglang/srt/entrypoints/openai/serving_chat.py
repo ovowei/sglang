@@ -693,6 +693,11 @@ class OpenAIServingChat(OpenAIServingBase):
             return self.create_error_response(str(e), status_code=413, err_type="PayloadTooLargeError")
         except ValueError as e:
             return self.create_error_response(str(e))
+        first_chunk_error_response = self.create_error_response_from_first_streaming_chunk(
+            first_chunk
+        )
+        if first_chunk_error_response is not None:
+            return first_chunk_error_response
 
         async def prepend_first_chunk():
             yield first_chunk
