@@ -4,7 +4,7 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import orjson
 from fastapi import HTTPException, Request
@@ -230,6 +230,52 @@ class OpenAIServingBase(ABC):
             code=status_code,
         )
         return ORJSONResponse(content=error.model_dump(), status_code=status_code)
+
+    def create_error_response_from_first_streaming_chunk(
+        self,
+        first_chunk: str,
+    ) -> Optional[ORJSONResponse]:
+        if not isinstance(first_chunk, str):
+            return None
+        first_chunk = first_chunk.strip()
+        if not first_chunk.startswith("data:"):
+            return None
+
+        data = first_chunk[len("data:") :].strip()
+
+        if data == "[DONE]":
+            return None
+
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        error = payload.get("error")
+        if not isinstance(error, dict):
+            return None
+
+        status_code = (
+            error.get("code")
+            or error.get("status")
+            or error.get("status_code")
+            or 500
+        )
+        if not isinstance(status_code, int) or status_code < 100 or status_code > 599:
+            status_code = 500
+        return self.create_error_response(
+            message=error.get(
+                "message",
+                "Streaming request failed before first chunk.",
+            ),
+            err_type=error.get("type", "InternalServerError"),
+            status_code=status_code,
+            param=error.get("param"),
+        )
+    
 
     def create_streaming_error_response(
         self,
