@@ -860,10 +860,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 del input_ids[_max_req_len:]
                 input_token_num = len(input_ids)
             else:
-                raise ValueError(
+                error_msg = (
                     f"The input ({input_token_num} tokens) is longer than the "
                     f"model's context length ({self.context_len} tokens)."
                 )
+                if "glm" in self.model_path.lower():
+                    raise PayloadTooLargeError(error_msg)
+                raise ValueError(error_msg)
 
         # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
