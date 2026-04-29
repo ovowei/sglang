@@ -1974,10 +1974,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         # We should batch all top-k tokens in all positions.
         ret = []
         for i in range(len(token_logprobs_val)):
-            if token_logprobs_val[i]:
+            logprobs_val = token_logprobs_val[i]
+            logprobs_idx = token_logprobs_idx[i]
+            if hasattr(logprobs_val, "tolist"):
+                logprobs_val = logprobs_val.tolist()
+            if hasattr(logprobs_idx, "tolist"):
+                logprobs_idx = logprobs_idx.tolist()
+            if logprobs_val is not None and len(logprobs_val) > 0:
                 ret.append(
                     self.detokenize_logprob_tokens(
-                        token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
+                        logprobs_val, logprobs_idx, decode_to_text
                     )
                 )
             else:
