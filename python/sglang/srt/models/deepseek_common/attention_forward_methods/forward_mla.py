@@ -308,7 +308,13 @@ class DeepseekMLAForwardMixin:
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        if nsa_use_prefill_cp(forward_batch):
+        defer_trtllm_fp8_cp_rebuild = (
+            nsa_use_prefill_cp(forward_batch)
+            and self.current_attention_backend == "nsa"
+            and get_global_server_args().nsa_prefill_backend == "trtllm"
+            and forward_batch.attn_backend.kv_cache_dtype == torch.float8_e4m3fn
+        )
+        if nsa_use_prefill_cp(forward_batch) and not defer_trtllm_fp8_cp_rebuild:
             # support allgather+rerrange
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe

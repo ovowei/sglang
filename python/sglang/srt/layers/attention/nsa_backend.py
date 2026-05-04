@@ -23,10 +23,12 @@ from sglang.srt.layers.attention.nsa.transform_index import (
 )
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_prefill_cp_round_robin_split,
+    cp_all_gather_rerange_output,
     compute_nsa_seqlens,
     is_nsa_enable_prefill_cp,
     nsa_cp_round_robin_split_data,
     nsa_cp_round_robin_split_q_seqs,
+    nsa_use_prefill_cp,
     pad_nsa_cache_seqlens,
 )
 from sglang.srt.layers.attention.utils import (
@@ -34,7 +36,7 @@ from sglang.srt.layers.attention.utils import (
     mla_quantize_and_rope_for_fp8,
     seqlens_expand_triton,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import get_attention_cp_size, get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip
 
@@ -1959,6 +1961,21 @@ class NativeSparseAttnBackend(
                 self.qk_rope_head_dim,
             )
             merge_query = False
+
+            # Under NSA prefill CP, q/q_rope/positions are rank-local here while
+            # the original rebuild_cp_kv_cache() path would have expanded KV to
+            # the global token layout too early. Keep rope+quantize on local nnz,
+            # then rebuild the full-sequence KV layout on the processed tensors.
+            if is_prefill and nsa_use_prefill_cp(forward_batch):
+                merged_k = torch.cat([k, k_rope], dim=-1)
+                merged_k = cp_all_gather_rerange_output(
+                    merged_k.contiguous(),
+                    get_attention_cp_size(),
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+                k = merged_k[..., : self.kv_lora_rank]
+                k_rope = merged_k[..., self.kv_lora_rank :]
 
             # Save KV cache if requested
         if save_kv_cache:
