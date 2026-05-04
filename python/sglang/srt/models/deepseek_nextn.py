@@ -183,6 +183,7 @@ class DeepseekModelNextN(nn.Module):
         if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+        forward_batch.attn_positions = positions
         residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states, residual, topk_indices = self.decoder(

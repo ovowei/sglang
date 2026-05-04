@@ -1954,7 +1954,11 @@ class NativeSparseAttnBackend(
                 q_rope,
                 k.squeeze(1),
                 k_rope.squeeze(1),
-                forward_batch.positions,
+                (
+                    forward_batch.attn_positions
+                    if forward_batch.attn_positions is not None
+                    else forward_batch.positions
+                ),
                 cos_sin_cache,
                 is_neox,
                 self.kv_lora_rank,

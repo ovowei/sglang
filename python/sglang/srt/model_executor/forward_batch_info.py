@@ -325,6 +325,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Position information
     positions: torch.Tensor = None
+    # Effective positions used by attention kernels when local position layout
+    # differs from positions, e.g. NSA prefill context parallel rebuild.
+    attn_positions: Optional[torch.Tensor] = None
 
     # For extend
     extend_num_tokens: Optional[int] = None

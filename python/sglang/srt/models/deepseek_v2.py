@@ -2010,6 +2010,7 @@ class DeepseekV2Model(nn.Module):
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+            forward_batch.attn_positions = positions
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         # Compute llama 4 scaling once per forward pass if enabled

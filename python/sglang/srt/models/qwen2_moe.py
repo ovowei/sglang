@@ -657,6 +657,7 @@ class Qwen2MoeModel(nn.Module):
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+            forward_batch.attn_positions = positions
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
