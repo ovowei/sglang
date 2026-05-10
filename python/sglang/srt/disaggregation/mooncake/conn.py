@@ -1040,7 +1040,9 @@ class MooncakeKVManager(CommonKVManager):
                 )
         elif state_type in ["swa", "nsa"]:
             logger.debug(
-                f"maybe_send_extra swa/nsa {prefill_state_indices=} {dst_state_data_ptrs=} "
+                "maybe_send_extra swa/nsa prefill_state_indices=%s dst_state_data_ptrs=%s",
+                prefill_state_indices,
+                dst_state_data_ptrs,
             )
             # SWA and NSA hybrid models do not support different TP sizes yet
             if (
