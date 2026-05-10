@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import regex as re
 import torch
@@ -264,6 +264,33 @@ def slice_nvfp4_output(
     if out.shape[-1] != output_size:
         return out[..., :output_size].contiguous()
     return out
+
+
+def _sanitize_nvfp4_weight_scale_(
+    weight_scale: torch.Tensor,
+    name: str,
+) -> None:
+    """Replace invalid FP8 block scales from exported checkpoints in-place."""
+
+    if weight_scale.dtype != torch.float8_e4m3fn or weight_scale.numel() == 0:
+        return
+
+    weight_scale_fp32 = weight_scale.to(torch.float32)
+    invalid_mask = ~torch.isfinite(weight_scale_fp32)
+    if not bool(invalid_mask.any().item()):
+        return
+
+    max_fp8 = torch.finfo(torch.float8_e4m3fn).max
+    invalid_count = int(invalid_mask.sum().item())
+    logger.warning_once(
+        "NVFP4 checkpoint contains non-finite FP8 block scales; "
+        "replacing invalid values with max finite FP8 scale. "
+        f"name={name} invalid_count={invalid_count}"
+    )
+    weight_scale_fp32 = torch.nan_to_num(
+        weight_scale_fp32, nan=max_fp8, posinf=max_fp8, neginf=0.0
+    ).clamp_(min=0.0, max=max_fp8)
+    weight_scale.copy_(weight_scale_fp32.to(weight_scale.dtype))
 
 
 # TODO make it true by default when the DeepEP PR is merged
@@ -775,6 +802,300 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp8MoEMethod(self.fp8_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
+            return None
+
+        return None
+
+
+class KimiMixedMoEQuantConfig(ModelOptQuantConfig):
+    """Kimi K2.x MoE-only mixed INT4/NVFP4 checkpoint config.
+
+    This config is intentionally layer-scoped. It keeps the existing ModelOpt
+    NVFP4 implementation for selected MoE layers and reuses compressed-tensors
+    W4A16 for the original Kimi INT4 MoE layers.
+    """
+
+    _KIMI_MIXED_ALGOS = {
+        "KIMI_MIXED_MOE",
+        "KIMI_MIXED_MOE_NVFP4_INT4",
+    }
+
+    def __init__(
+        self,
+        kv_cache_quant_algo: Optional[str],
+        exclude_modules: Optional[List[str]],
+        packed_modules_mapping: Optional[Dict[str, List[str]]],
+        routed_moe_rules: List[Tuple[int, int, str]],
+        shared_expert_rules: List[Tuple[int, int, str]],
+        nvfp4_config: "ModelOptFp4Config",
+        compressed_tensors_config: "QuantizationConfig",
+    ) -> None:
+        super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
+        self.routed_moe_rules = routed_moe_rules
+        self.shared_expert_rules = shared_expert_rules
+        self.nvfp4_config = nvfp4_config
+        self.compressed_tensors_config = compressed_tensors_config
+
+    @classmethod
+    def override_quantization_method(cls, hf_quant_config, user_quant):
+        if hf_quant_config is None:
+            return None
+        quant_algo = str(hf_quant_config.get("quant_algo", "")).upper()
+        quant_method = str(hf_quant_config.get("quant_method", "")).lower()
+        if quant_method == cls.get_name() or quant_algo in cls._KIMI_MIXED_ALGOS:
+            return cls.get_name()
+        return None
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "kimi_mixed_moe"
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+        return [torch.bfloat16, torch.half]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return ModelOptFp4Config.get_min_capability()
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "KimiMixedMoEQuantConfig":
+        quantization_section = config.get("quantization", config)
+        quant_algo = str(quantization_section.get("quant_algo", "")).upper()
+        quant_method = str(quantization_section.get("quant_method", "")).lower()
+        if quant_method != cls.get_name() and quant_algo not in cls._KIMI_MIXED_ALGOS:
+            raise ValueError(
+                "KimiMixedMoEQuantConfig requires quant_method='kimi_mixed_moe' "
+                "or quant_algo='KIMI_MIXED_MOE'."
+            )
+
+        kv_cache_quant_algo = quantization_section.get("kv_cache_quant_algo")
+        exclude_modules = quantization_section.get("exclude_modules")
+        if exclude_modules is None:
+            exclude_modules = quantization_section.get("ignore")
+        packed_modules_mapping = config.get("packed_modules_mapping")
+
+        group_size = int(quantization_section.get("group_size", 16))
+        nvfp4_config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            kv_cache_quant_algo=kv_cache_quant_algo,
+            exclude_modules=[],
+            packed_modules_mapping=packed_modules_mapping,
+            group_size=group_size,
+        )
+        nvfp4_config.force_flashinfer_trtllm_routed = True
+
+        compressed_cfg_dict = cls._compressed_tensors_config_from_section(
+            quantization_section, packed_modules_mapping
+        )
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsConfig,
+        )
+
+        compressed_tensors_config = CompressedTensorsConfig.from_config(
+            compressed_cfg_dict
+        )
+
+        routed_rules, shared_rules = cls._parse_moe_layer_quant_map(
+            quantization_section.get("moe_layer_quant_map", [])
+        )
+        if not routed_rules:
+            raise ValueError(
+                "kimi_mixed_moe requires non-empty quantization.moe_layer_quant_map."
+            )
+
+        return cls(
+            kv_cache_quant_algo=kv_cache_quant_algo,
+            exclude_modules=exclude_modules,
+            packed_modules_mapping=packed_modules_mapping,
+            routed_moe_rules=routed_rules,
+            shared_expert_rules=shared_rules,
+            nvfp4_config=nvfp4_config,
+            compressed_tensors_config=compressed_tensors_config,
+        )
+
+    @staticmethod
+    def _compressed_tensors_config_from_section(
+        quantization_section: Dict[str, Any],
+        packed_modules_mapping: Optional[Dict[str, List[str]]],
+    ) -> Dict[str, Any]:
+        config = (
+            quantization_section.get("compressed_tensors_config")
+            or quantization_section.get("int4_compressed_tensors_config")
+        )
+        if config is None:
+            config = {
+                "format": "pack-quantized",
+                "ignore": [],
+                "config_groups": {
+                    "group_0": {
+                        "targets": ["Linear"],
+                        "weights": {
+                            "type": "int",
+                            "num_bits": 4,
+                            "strategy": "group",
+                            "group_size": 32,
+                            "symmetric": True,
+                            "dynamic": False,
+                            "actorder": False,
+                        },
+                    }
+                },
+            }
+        config = dict(config)
+        config.setdefault("ignore", [])
+        config["packed_modules_mapping"] = packed_modules_mapping or {}
+        return config
+
+    @classmethod
+    def _parse_moe_layer_quant_map(
+        cls, raw_map: Any
+    ) -> Tuple[List[Tuple[int, int, str]], List[Tuple[int, int, str]]]:
+        routed_rules: List[Tuple[int, int, str]] = []
+        shared_rules: List[Tuple[int, int, str]] = []
+
+        if isinstance(raw_map, dict):
+            items = [
+                {"layers": layers, "routed_experts": routed}
+                for layers, routed in raw_map.items()
+            ]
+        else:
+            items = list(raw_map or [])
+
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError(
+                    "Each kimi_mixed_moe moe_layer_quant_map entry must be a dict."
+                )
+            ranges = cls._parse_layer_ranges(item.get("layers"))
+            routed_algo = cls._normalize_quant_kind(
+                item.get("routed_experts", item.get("experts"))
+            )
+            shared_algo_raw = item.get("shared_experts")
+            shared_algo = (
+                cls._normalize_quant_kind(shared_algo_raw)
+                if shared_algo_raw is not None
+                else None
+            )
+
+            for start, end in ranges:
+                routed_rules.append((start, end, routed_algo))
+                if shared_algo is not None:
+                    shared_rules.append((start, end, shared_algo))
+
+        return routed_rules, shared_rules
+
+    @staticmethod
+    def _parse_layer_ranges(layers: Any) -> List[Tuple[int, int]]:
+        if layers is None:
+            raise ValueError("kimi_mixed_moe layer rule is missing 'layers'.")
+        if isinstance(layers, int):
+            return [(layers, layers)]
+        if isinstance(layers, str):
+            ranges = []
+            for part in layers.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if "-" in part:
+                    start, end = part.split("-", maxsplit=1)
+                    ranges.append((int(start), int(end)))
+                else:
+                    value = int(part)
+                    ranges.append((value, value))
+            return ranges
+        if isinstance(layers, (list, tuple)):
+            if len(layers) == 2 and all(isinstance(x, int) for x in layers):
+                return [(int(layers[0]), int(layers[1]))]
+            ranges: List[Tuple[int, int]] = []
+            for item in layers:
+                ranges.extend(KimiMixedMoEQuantConfig._parse_layer_ranges(item))
+            return ranges
+        raise ValueError(f"Unsupported layer range spec: {layers!r}")
+
+    @staticmethod
+    def _normalize_quant_kind(value: Any) -> str:
+        if value is None:
+            raise ValueError("Missing quant kind in kimi_mixed_moe layer rule.")
+        normalized = str(value).lower().replace("-", "_")
+        if normalized in {"nvfp4", "fp4", "modelopt_fp4"}:
+            return "NVFP4"
+        if normalized in {
+            "int4",
+            "w4a16",
+            "wna16",
+            "compressed_tensors",
+            "compressed_tensors_wna16",
+        }:
+            return "COMPRESSED_TENSORS"
+        if normalized in {"none", "bf16", "fp16", "unquant", "unquantized"}:
+            return "UNQUANTIZED"
+        raise ValueError(f"Unsupported kimi_mixed_moe quant kind: {value!r}")
+
+    @staticmethod
+    def _layer_id_from_prefix(prefix: str) -> Optional[int]:
+        match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", prefix)
+        return int(match.group(1)) if match else None
+
+    @staticmethod
+    def _resolve_layer_rule(
+        prefix: str, rules: List[Tuple[int, int, str]]
+    ) -> Optional[str]:
+        layer_id = KimiMixedMoEQuantConfig._layer_id_from_prefix(prefix)
+        if layer_id is None:
+            return None
+        for start, end, algo in rules:
+            if start <= layer_id <= end:
+                return algo
+        return None
+
+    @staticmethod
+    def _is_shared_expert_prefix(prefix: str) -> bool:
+        return ".mlp.shared_experts." in f".{prefix}"
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
+        super().apply_weight_name_mapper(hf_to_sglang_mapper)
+        self.compressed_tensors_config.apply_weight_name_mapper(hf_to_sglang_mapper)
+
+    def _get_compressed_tensors_method(self, layer: torch.nn.Module, prefix: str):
+        return self.compressed_tensors_config.get_quant_method(layer, prefix)
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[QuantizeMethodBase]:
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if isinstance(layer, LinearBase):
+            if self._is_shared_expert_prefix(prefix):
+                shared_algo = self._resolve_layer_rule(prefix, self.shared_expert_rules)
+                if shared_algo == "NVFP4":
+                    return ModelOptFp4LinearMethod(self.nvfp4_config)
+                if shared_algo == "COMPRESSED_TENSORS":
+                    return self._get_compressed_tensors_method(layer, prefix)
+                if shared_algo == "UNQUANTIZED":
+                    return UnquantizedLinearMethod()
+
+            if is_layer_skipped(
+                prefix, self.exclude_modules, self.packed_modules_mapping
+            ) or self.is_layer_excluded(prefix):
+                return UnquantizedLinearMethod()
+
+            return UnquantizedLinearMethod()
+
+        if self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
+            return ModelOptFp8KVCacheMethod(self.nvfp4_config)
+
+        if isinstance(layer, FusedMoE):
+            routed_algo = self._resolve_layer_rule(prefix, self.routed_moe_rules)
+            if routed_algo == "NVFP4":
+                return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
+            if routed_algo == "COMPRESSED_TENSORS":
+                return self._get_compressed_tensors_method(layer, prefix)
+            if routed_algo == "UNQUANTIZED":
+                return None
+            if self.is_layer_excluded(prefix):
+                return None
             return None
 
         return None
@@ -1367,8 +1688,34 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        _sanitize_nvfp4_weight_scale_(
+            layer.weight_scale, getattr(layer, "prefix", "nvfp4_linear")
+        )
+
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
+
+        if getattr(layer.weight_scale_2, "numel", lambda: 0)() > 1 and hasattr(
+            layer, "output_sizes"
+        ):
+            # Merged gate/up linear can have one global NVFP4 scale per shard.
+            # The runtime GEMM takes one alpha, so fold shard differences into
+            # the FP8 block scales while preserving the represented weights.
+            common_weight_scale_2 = torch.clamp(layer.weight_scale_2.max(), min=1e-12)
+            output_offset = 0
+            for shard_id, output_size in enumerate(layer.output_sizes):
+                shard_size = output_size // layer.tp_size
+                block = layer.weight_scale.narrow(0, output_offset, shard_size)
+                ratio = (
+                    layer.weight_scale_2[shard_id].to(torch.float32)
+                    / common_weight_scale_2
+                )
+                block.copy_((block.to(torch.float32) * ratio).to(block.dtype))
+                output_offset += shard_size
+            layer.weight_scale_2.copy_(
+                torch.full_like(layer.weight_scale_2, common_weight_scale_2)
+            )
+            weight_scale_2 = common_weight_scale_2
 
         # Keep per-shard scales intact for hot reload; derive scalar params below.
         copy_or_rebind_param(
@@ -1716,16 +2063,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # Some checkpoints store a shared scale for w1/w3.
                 w13_weight_scale_2 = layer.w13_weight_scale_2
             else:
-                if layer.w13_weight_scale_2.shape[1] >= 2 and not torch.allclose(
-                    layer.w13_weight_scale_2[:, 0],
-                    layer.w13_weight_scale_2[:, 1],
-                ):
-                    logger.warning_once(
-                        "w1_weight_scale_2 must match w3_weight_scale_2. "
-                        "Accuracy may be affected."
+                if layer.w13_weight_scale_2.shape[1] >= 2:
+                    w13_weight_scale_2 = self._fold_w13_global_scales_into_block_scales(
+                        layer
                     )
-
-                w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
+                else:
+                    w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
         else:
             w13_weight_scale_2 = layer.w13_weight_scale_2[:]
 
@@ -1795,6 +2138,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             }
         )
         block_size = 16
+        _sanitize_nvfp4_weight_scale_(
+            layer.w13_weight_scale, f"moe_layer_{layer.layer_id}.w13_weight_scale"
+        )
+        _sanitize_nvfp4_weight_scale_(
+            layer.w2_weight_scale, f"moe_layer_{layer.layer_id}.w2_weight_scale"
+        )
+
         # Validate weight scales
         assert_dim = 2 if layer.moe_runner_config.is_gated else 1
         for name, weight_scale in [
@@ -1968,6 +2318,27 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     hidden_size=hidden_size,
                 )  # k
 
+    def _fold_w13_global_scales_into_block_scales(
+        self, layer: torch.nn.Module
+    ) -> torch.Tensor:
+        """Normalize gated W13 to one global scale per expert."""
+
+        w13_weight_scale_2 = layer.w13_weight_scale_2.to(torch.float32)
+        common = torch.clamp(w13_weight_scale_2.max(dim=1).values, min=1e-12)
+
+        if not torch.allclose(w13_weight_scale_2[:, 0], w13_weight_scale_2[:, 1]):
+            intermediate = layer.intermediate_size_per_partition
+            for shard_id in range(2):
+                start = shard_id * intermediate
+                block = layer.w13_weight_scale.narrow(1, start, intermediate)
+                ratio = (w13_weight_scale_2[:, shard_id] / common).view(-1, 1, 1)
+                block.copy_((block.to(torch.float32) * ratio).to(block.dtype))
+            layer.w13_weight_scale_2.copy_(
+                common[:, None].expand_as(layer.w13_weight_scale_2)
+            )
+
+        return common
+
     @property
     def load_up_proj_weight_first(self) -> bool:
         # Load W13 as [Up, Gate] for FlashInfer CUTLASS and CuteDSL v2 kernels.
@@ -1985,7 +2356,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_auto():
             # TRTLLM is currently the most performant and tested FP4 MoE
             # backend, so use it as the default.
-            moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+            moe_runner_backend = (
+                MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
+                if getattr(self.quant_config, "force_flashinfer_trtllm_routed", False)
+                else MoeRunnerBackend.FLASHINFER_TRTLLM
+            )
+        elif moe_runner_backend.is_flashinfer_trtllm() and getattr(
+            self.quant_config, "force_flashinfer_trtllm_routed", False
+        ):
+            moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
 
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func

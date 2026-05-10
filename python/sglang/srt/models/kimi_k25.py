@@ -771,6 +771,19 @@ class KimiK25ForConditionalGeneration(nn.Module):
                         .replace("mm_projector.proj.2", "mm_projector.linear_2")
                     )
                     if vname not in vision_params:
+                        base_vname = None
+                        for quant_suffix in (
+                            ".weight_packed",
+                            ".weight_scale",
+                            ".weight_shape",
+                        ):
+                            if vname.endswith(quant_suffix):
+                                base_vname = (
+                                    vname[: -len(quant_suffix)] + ".weight"
+                                )
+                                break
+                        if base_vname is not None and base_vname in vision_params:
+                            continue
                         raise ValueError(f"Weight {vname} not found in params_dict")
                     param = vision_params[vname]
                     weight_loader = getattr(

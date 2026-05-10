@@ -225,6 +225,9 @@ class DeepseekV2WeightLoaderMixin:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+                    if name not in params_dict:
+                        logger.warning(f"{name} not found in params_dict.")
+                        break
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     maybe_executor_submit(

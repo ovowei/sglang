@@ -913,7 +913,9 @@ class ModelConfig:
         json_quant_configs = quant_config_dict["quantization"]
         quant_algo = json_quant_configs.get("quant_algo", None)
 
-        if quant_algo == "MIXED_PRECISION":
+        if quant_algo in ("KIMI_MIXED_MOE", "KIMI_MIXED_MOE_NVFP4_INT4"):
+            return {"quant_method": "kimi_mixed_moe", "quant_algo": quant_algo}
+        elif quant_algo == "MIXED_PRECISION":
             architectures = getattr(self.hf_config, "architectures", []) or []
             if getattr(self.hf_config, "model_type", None) == "nemotron_h" or any(
                 arch.startswith("NemotronH") for arch in architectures
@@ -972,6 +974,10 @@ class ModelConfig:
             raise ValueError(
                 "modelopt_mixed is only supported for pre-quantized checkpoints."
             )
+        elif self.quantization == "kimi_mixed_moe":
+            raise ValueError(
+                "kimi_mixed_moe is only supported for pre-quantized checkpoints."
+            )
         elif self.quantization == "modelopt":
             # Auto-detect from model config
             quant_cfg = self._parse_quant_hf_config()
@@ -1004,6 +1010,7 @@ class ModelConfig:
             "modelopt_fp8",
             "modelopt_fp4",
             "modelopt_mixed",
+            "kimi_mixed_moe",
         ]
         modelopt_quantization_specified = (
             self.quantization in _MODELOPT_QUANTIZATION_METHODS
@@ -1046,6 +1053,7 @@ class ModelConfig:
             "modelopt_fp8",
             "modelopt_fp4",
             "modelopt_mixed",
+            "kimi_mixed_moe",
             "gptq_marlin_24",
             "gptq_marlin",
             "awq_marlin",
@@ -1066,6 +1074,7 @@ class ModelConfig:
             "modelopt_fp8": ["modelopt"],
             "modelopt_fp4": ["modelopt"],
             "modelopt_mixed": ["modelopt"],
+            "kimi_mixed_moe": ["modelopt"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],

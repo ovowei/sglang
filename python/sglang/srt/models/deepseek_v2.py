@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -190,6 +191,31 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+_KIMI_MIXED_MOE_FINITE_CHECK = os.getenv(
+    "SGLANG_KIMI_MIXED_MOE_FINITE_CHECK", "0"
+).lower() in {"1", "true", "yes", "on"}
+
+
+def _assert_finite_for_kimi_mixed_moe(tensor: torch.Tensor, name: str) -> None:
+    if not _KIMI_MIXED_MOE_FINITE_CHECK:
+        return
+    finite = torch.isfinite(tensor)
+    if bool(finite.all().item()):
+        return
+    finite_values = tensor[finite]
+    min_value = (
+        float(finite_values.min().item()) if finite_values.numel() > 0 else float("nan")
+    )
+    max_value = (
+        float(finite_values.max().item()) if finite_values.numel() > 0 else float("nan")
+    )
+    nan_count = int(torch.isnan(tensor).sum().item())
+    inf_count = int(torch.isinf(tensor).sum().item())
+    raise RuntimeError(
+        f"{name} has non-finite values: shape={tuple(tensor.shape)}, "
+        f"dtype={tensor.dtype}, nan={nan_count}, inf={inf_count}, "
+        f"finite_min={min_value}, finite_max={max_value}"
+    )
 
 
 class DeepseekV2MLP(nn.Module):
@@ -206,6 +232,7 @@ class DeepseekV2MLP(nn.Module):
     ) -> None:
         super().__init__()
         self.tp_size = tp_size
+        self.prefix = prefix
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -263,11 +290,18 @@ class DeepseekV2MLP(nn.Module):
             x = (x, None, y)
 
         gate_up, _ = self.gate_up_proj(x)
+        _assert_finite_for_kimi_mixed_moe(
+            gate_up, f"{self.prefix}.gate_up_proj output"
+        )
         x = self.act_fn(gate_up)
+        _assert_finite_for_kimi_mixed_moe(
+            x, f"{self.prefix}.gate_up_proj activation output"
+        )
         x, _ = self.down_proj(
             x,
             skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
         )
+        _assert_finite_for_kimi_mixed_moe(x, f"{self.prefix}.down_proj output")
         return x
 
 
@@ -455,6 +489,24 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
+        topk_output_format = (
+            TopKOutputFormat.STANDARD
+            if (quant_config is None)
+            and (not get_moe_runner_backend().is_flashinfer_trtllm())
+            else None
+        )
+        if (
+            quant_config is not None
+            and getattr(quant_config, "get_name", lambda: None)() == "kimi_mixed_moe"
+            and hasattr(quant_config, "_resolve_layer_rule")
+            and hasattr(quant_config, "routed_moe_rules")
+        ):
+            routed_algo = quant_config._resolve_layer_rule(
+                prefix, quant_config.routed_moe_rules
+            )
+            if routed_algo == "NVFP4":
+                topk_output_format = TopKOutputFormat.STANDARD
+
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             layer_id=self.layer_id,
@@ -470,12 +522,7 @@ class DeepseekV2MoE(nn.Module):
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
             # and requires the output format to be standard (except trtllm). We use quant_config to determine the output format.
-            output_format=(
-                TopKOutputFormat.STANDARD
-                if (quant_config is None)
-                and (not get_moe_runner_backend().is_flashinfer_trtllm())
-                else None
-            ),
+            output_format=topk_output_format,
         )
 
         self.shared_experts_is_int8 = False
@@ -689,8 +736,14 @@ class DeepseekV2MoE(nn.Module):
                 shared_output = self._forward_shared_experts(
                     hidden_states, gemm_output_zero_allocator
                 )
+                _assert_finite_for_kimi_mixed_moe(
+                    shared_output, f"layer {self.layer_id} shared expert output"
+                )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+            _assert_finite_for_kimi_mixed_moe(
+                router_logits, f"layer {self.layer_id} router logits"
+            )
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -734,6 +787,9 @@ class DeepseekV2MoE(nn.Module):
             hidden_states,
             topk_output,
         )
+        _assert_finite_for_kimi_mixed_moe(
+            final_hidden_states, f"layer {self.layer_id} routed expert output"
+        )
         if (
             not _is_cuda
             and not _is_musa
@@ -745,12 +801,19 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states += shared_output
+            _assert_finite_for_kimi_mixed_moe(
+                final_hidden_states,
+                f"layer {self.layer_id} routed plus shared output",
+            )
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
             use_reduce_scatter=use_reduce_scatter,
             should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            _assert_finite_for_kimi_mixed_moe(
+                final_hidden_states, f"layer {self.layer_id} post allreduce output"
+            )
         return final_hidden_states
 
     def forward_cpu(
@@ -1766,6 +1829,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch,
             getattr(self, "_gfx95_quant_format", ""),
         )
+        _assert_finite_for_kimi_mixed_moe(
+            hidden_states, f"layer {self.layer_id} prepare_attn hidden_states"
+        )
+        if residual is not None:
+            _assert_finite_for_kimi_mixed_moe(
+                residual, f"layer {self.layer_id} prepare_attn residual"
+            )
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -1780,10 +1850,20 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
+        _assert_finite_for_kimi_mixed_moe(
+            hidden_states, f"layer {self.layer_id} attention output"
+        )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        _assert_finite_for_kimi_mixed_moe(
+            hidden_states, f"layer {self.layer_id} prepare_mlp hidden_states"
+        )
+        if residual is not None:
+            _assert_finite_for_kimi_mixed_moe(
+                residual, f"layer {self.layer_id} prepare_mlp residual"
+            )
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -1806,6 +1886,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_reduce_scatter,
             gemm_output_zero_allocator,
         )
+        _assert_finite_for_kimi_mixed_moe(
+            hidden_states, f"layer {self.layer_id} mlp output"
+        )
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -1814,6 +1897,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+            _assert_finite_for_kimi_mixed_moe(
+                hidden_states, f"layer {self.layer_id} postprocess hidden_states"
+            )
+            if residual is not None:
+                _assert_finite_for_kimi_mixed_moe(
+                    residual, f"layer {self.layer_id} postprocess residual"
+                )
 
         return hidden_states, residual, topk_indices
 
@@ -2115,6 +2205,11 @@ class DeepseekV2Model(nn.Module):
                     llama_4_scaling,
                     prev_topk_indices=topk_indices,
                 )
+                _assert_finite_for_kimi_mixed_moe(
+                    hidden_states, f"layer {i} hidden_states"
+                )
+                if residual is not None:
+                    _assert_finite_for_kimi_mixed_moe(residual, f"layer {i} residual")
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -2321,6 +2416,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
+        _assert_finite_for_kimi_mixed_moe(hidden_states, "model output hidden_states")
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
