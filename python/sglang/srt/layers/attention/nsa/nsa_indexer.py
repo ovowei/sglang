@@ -682,6 +682,7 @@ class Indexer(MultiPlatformOp):
                 ke_offset=lengths_chunk,
                 batch_idx_list=batch_idx_chunk,
                 topk_indices_offset_override=topk_offset_chunk,
+                cu_seqlens_q_sum=B_chunk if cu_seqlens_q_chunk is not None else None,
             )
             topk_result[start:end] = raw_topk_chunk
             start = end

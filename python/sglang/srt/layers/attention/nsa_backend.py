@@ -220,6 +220,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         ke_offset: torch.Tensor = None,
         batch_idx_list: List[int] = None,
         topk_indices_offset_override: Optional[torch.Tensor] = None,
+        cu_seqlens_q_sum: Optional[int] = None,
     ) -> torch.Tensor:
         from sgl_kernel import (
             fast_topk_transform_fused,
@@ -236,6 +237,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             cu_topk_indices_offset = torch.repeat_interleave(
                 cu_seqlens_q_topk[:-1],
                 cu_seqlens_q,
+                output_size=cu_seqlens_q_sum,
             )
         else:
             cu_seqlens_q_topk = self.attn_metadata.cu_seqlens_q
@@ -585,6 +587,7 @@ class NativeSparseAttnBackend(
                 topk_indices_offset = torch.repeat_interleave(
                     cu_seqlens_k[:-1],
                     extend_seq_lens,
+                    output_size=sum(extend_seq_lens_cpu),
                 )
         else:
             assert False, f"Unsupported {forward_batch.forward_mode = }"
