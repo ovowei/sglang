@@ -989,9 +989,15 @@ class Indexer(MultiPlatformOp):
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
-                layer_id=layer_id
-            )
+            pool = forward_batch.token_to_kv_pool
+            if (
+                getattr(pool, "layer_shard_enabled", False)
+                and getattr(pool, "remote_index_layer_id", None) == layer_id
+            ):
+                pool.remote_index_layer_id = None
+            if not pool._is_layer_owned(layer_id):
+                return
+            buf = pool.get_index_k_with_scale_buffer(layer_id)
             fused_store_index_k_cache(
                 key,
                 buf,

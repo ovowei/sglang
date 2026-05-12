@@ -54,6 +54,7 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
+    layer_split: bool
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -73,6 +74,7 @@ class PrefillServerInfo:
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
+        self.layer_split = bool(self.layer_split)
 
 
 @dataclasses.dataclass
@@ -121,6 +123,12 @@ class CommonKVManager(BaseKVManager):
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
         )
+        # layer_split: P side pp_size=1 but each TP rank owns a layer slice.
+        # Stored here so _register_to_bootstrap can include it in the payload.
+        self.layer_split = (
+            getattr(server_args, 'enable_nsa_cache_layer_split', False)
+            and self.pp_size == 1
+        )
 
         # bind zmq socket
         context = zmq.Context()
@@ -138,6 +146,7 @@ class CommonKVManager(BaseKVManager):
             # participate in KV transfer; Otherwise only CP rank 0 sends.
             self.is_dummy_cp_rank = (
                 not self.enable_all_cp_ranks_for_transfer
+                and not self.layer_split
                 and self.attn_cp_size > 1
                 and self.attn_cp_rank != 0
             )
@@ -310,11 +319,15 @@ class CommonKVManager(BaseKVManager):
             target_cp_ranks = [self.attn_cp_rank]
         else:
             target_cp_ranks = list(range(info.attn_cp_size))
-            if not self.enable_all_cp_ranks_for_transfer:
+            if not self.enable_all_cp_ranks_for_transfer and not info.layer_split:
                 # Only retrieve from prefill CP rank 0 when not using all ranks
                 target_cp_ranks = target_cp_ranks[:1]
                 required_prefill_response_num *= 1
             else:
+                # layer-split: each cp rank i registered as (cp_rank=i).
+                # D side connects to all P cp ranks
+                # All are real (no dummy) — each holds a distinct layer slice.
+                # required_prefill_response_num = N (one Success per layer-slice rank).
                 required_prefill_response_num *= info.attn_cp_size // self.attn_cp_size
 
         # PP rank mapping — decode pp size should be equal to prefill pp size or 1
@@ -354,6 +367,7 @@ class CommonKVManager(BaseKVManager):
             "attn_dp_rank": self.attn_dp_rank,
             "pp_size": self.pp_size,
             "pp_rank": self.pp_rank,
+            "layer_split": self.layer_split,
             "system_dp_size": self.system_dp_size,
             "system_dp_rank": self.system_dp_rank,
             "rank_ip": self.local_ip,
@@ -728,6 +742,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
+        self.layer_split = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -818,6 +833,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 "load_balance_method", "follow_bootstrap_room"
             )
             self.follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
+        
+        # layer_split flag: set once from the first prefill rank that registers
+        if self.layer_split is None:
+            self.layer_split = bool(data.get("layer_split", False))
 
         if system_dp_size == 1:
             dp_group = attn_dp_rank
@@ -882,6 +901,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
+                layer_split=self.layer_split,
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 

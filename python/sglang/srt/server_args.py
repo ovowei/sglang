@@ -703,6 +703,9 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
+    # Enable nsa Device KV/indexer Cache optimization in cp mode.
+    # Only effective for NSA models
+    enable_nsa_cache_layer_split: bool = False
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -2212,6 +2215,23 @@ class ServerArgs:
                         f"Speculative decoding for {model_arch} is not compatible with radix cache when using --mamba-scheduler-strategy no_buffer."
                         "To use radix cache with speculative decoding, please use --mamba-scheduler-strategy extra_buffer and set SGLANG_ENABLE_SPEC_V2=1."
                     )
+
+        if (
+            not is_deepseek_nsa(hf_config)
+            or not self.enable_nsa_prefill_context_parallel
+            or self.nsa_prefill_cp_mode != "round-robin-split"
+        ):
+            logger.info(
+                "Disabling nsa cache layer split for non-DSA model or non-round-robin-split cp mode"
+            )
+            self.enable_nsa_cache_layer_split = False
+
+        if self.enable_nsa_cache_layer_split and self.enable_hierarchical_cache:
+            raise ValueError(
+                "enable_nsa_cache_layer_split is incompatible with --enable-hierarchical-cache "
+                "(SharedLayerGroup host pool not available in this build). "
+                "Disable one of them."
+            )
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
@@ -5828,7 +5848,13 @@ class ServerArgs:
             default=ServerArgs.disaggregation_decode_polling_interval,
             help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
         )
-
+        parser.add_argument(
+            "--enable-nsa-cache-layer-split",
+            action="store_true",
+            default=ServerArgs.enable_nsa_cache_layer_split,
+            help="Enable nsa Device KV/indexer Cache optimization in cp mode."
+                 "Each rank stores only part of layers",
+        )
         # Encode prefill disaggregation
         parser.add_argument(
             "--encoder-only",

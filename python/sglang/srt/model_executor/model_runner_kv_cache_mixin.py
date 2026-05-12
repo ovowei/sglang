@@ -9,7 +9,7 @@ import torch
 from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_attention_cp_size, get_attention_cp_rank
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -71,13 +71,45 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
+def _is_nsa_cache_layer_split_enabled(model_runner: ModelRunner) -> bool:
+    return (
+        not model_runner.is_draft_worker
+        and model_runner.server_args.enable_nsa_cache_layer_split
+    )
+
+
+def _get_nsa_cp_layer_shard_info(model_runner: ModelRunner) -> tuple[Optional[int], int]:
+    if not _is_nsa_cache_layer_split_enabled(model_runner):
+        return None, 1
+    shard_size = get_attention_cp_size()
+    if shard_size <= 1:
+        return None, 1
+    return get_attention_cp_rank(), shard_size
+
+
 class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
+        effective_num_layers = num_layers
+        if (
+            self.use_mla_backend
+            and is_deepseek_nsa(self.model_config.hf_config)
+            and _is_nsa_cache_layer_split_enabled(self)
+        ):
+            shard_rank, shard_size = _get_nsa_cp_layer_shard_info(self)
+            if shard_rank is not None:
+                # Use a rank-invariant worst-case estimate so every rank computes the same
+                # per-token memory footprint. This avoids max_total_num_tokens skew across
+                # attention-TP ranks when ownership is interleaved by layer_id % shard_size.
+                owned_layers_upper_bound = (num_layers + shard_size - 1) // shard_size
+                effective_num_layers = max(
+                    1,
+                    owned_layers_upper_bound + 1,
+                )
         if self.use_mla_backend:
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
-                * num_layers
+                * effective_num_layers
                 * kv_size
             )
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
@@ -91,7 +123,7 @@ class ModelRunnerKVCacheMixin:
                         )
                         // scale_block_size
                     )
-                    * num_layers
+                    * effective_num_layers
                     * kv_size
                 )
 
@@ -105,7 +137,9 @@ class ModelRunnerKVCacheMixin:
                 element_size = torch._utils._element_size(
                     NSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                cell_size += (
+                    indexer_size_per_token * effective_num_layers * element_size
+                )
         else:
             if self.model_config.is_hybrid_swa:
                 full_layers_num = len(self.model_config.full_attention_layer_ids)
@@ -475,6 +509,7 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+        nsa_cp_layer_shard_rank, nsa_cp_layer_shard_size = _get_nsa_cp_layer_shard_info(self)
         if self.server_args.attention_backend == "ascend" and not self.mambaish_config:
             if self.is_hybrid_swa:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
@@ -562,6 +597,8 @@ class ModelRunnerKVCacheMixin:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                layer_shard_rank=nsa_cp_layer_shard_rank,
+                layer_shard_size=nsa_cp_layer_shard_size,
             )
             if self.enable_hisparse:
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config

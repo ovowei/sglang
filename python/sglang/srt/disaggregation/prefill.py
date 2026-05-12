@@ -145,7 +145,11 @@ class PrefillBootstrapQueue:
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
-        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
+        kv_args.prefill_start_layer = (
+            self.token_to_kv_pool.layer_shard_start
+            if self.token_to_kv_pool.layer_shard_enabled
+            else self.token_to_kv_pool.start_layer
+        )
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -156,12 +160,23 @@ class PrefillBootstrapQueue:
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
-            draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
-            )
-            kv_args.draft_kv_data_ptrs = draft_kv_data_ptrs
-            kv_args.draft_kv_data_lens = draft_kv_data_lens
-            kv_args.draft_kv_item_lens = draft_kv_item_lens
+            # With layer-split, only the last shard rank reports the real draft KV;
+            # other ranks report empty so the receiving side does not double-register.
+            if (
+                not self.token_to_kv_pool.layer_shard_enabled
+                or self.token_to_kv_pool.layer_shard_rank
+                    == self.token_to_kv_pool.layer_shard_size - 1
+            ):
+                draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
+                    self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+                )
+                kv_args.draft_kv_data_ptrs = draft_kv_data_ptrs
+                kv_args.draft_kv_data_lens = draft_kv_data_lens
+                kv_args.draft_kv_item_lens = draft_kv_item_lens
+            else:
+                kv_args.draft_kv_data_ptrs = []
+                kv_args.draft_kv_data_lens = []
+                kv_args.draft_kv_item_lens = []
         else:
             kv_args.draft_kv_data_ptrs = []
             kv_args.draft_kv_data_lens = []
