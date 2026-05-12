@@ -403,9 +403,11 @@ class Indexer(MultiPlatformOp):
             block_tables = metadata.get_page_table_64()
 
         max_seq_len = block_tables.shape[1] * page_size
-        kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
-            layer_id=layer_id
-        )
+        pool = forward_batch.token_to_kv_pool
+        if getattr(pool, "layer_shard_enabled", False):
+            kv_cache_fp8 = pool._get_broadcastable_index_buffer(layer_id)
+        else:
+            kv_cache_fp8 = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
 
         blocksize = page_size
         if (
