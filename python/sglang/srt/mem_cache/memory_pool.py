@@ -1618,11 +1618,32 @@ class MLATokenToKVPool(KVCache):
                     self.kv_broadcast_stream = self.device_module.Stream()
                     self.pending_remote_kv_layer_id: Optional[int] = None
                     self.pending_remote_kv_broadcast = False
+                    self.page_offset_buffer = torch.arange(
+                        self.page_size, device=self.device, dtype=torch.long
+                    )
+                    nope_dim, rope_dim = self._get_mla_kv_storage_dims()
+                    compact_prefetch_capacity = self.size + self.page_size
+                    self.compact_kv_prefetch_nope_buffer = torch.empty(
+                        (compact_prefetch_capacity, 1, nope_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    self.compact_kv_prefetch_rope_buffer = torch.empty(
+                        (compact_prefetch_capacity, 1, rope_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
 
     def _clear_buffers(self):
         del self.kv_buffer
         if hasattr(self, "remote_kv_buffer"):
             del self.remote_kv_buffer
+        if hasattr(self, "page_offset_buffer"):
+            del self.page_offset_buffer
+        if hasattr(self, "compact_kv_prefetch_nope_buffer"):
+            del self.compact_kv_prefetch_nope_buffer
+        if hasattr(self, "compact_kv_prefetch_rope_buffer"):
+            del self.compact_kv_prefetch_rope_buffer
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
@@ -1808,25 +1829,76 @@ class MLATokenToKVPool(KVCache):
             self.remote_kv_layer_id = self.pending_remote_kv_layer_id
         self.pending_remote_kv_layer_id = None
 
-    def prefetch_kv_buffer(self, layer_id: int) -> None:
+    def _get_mla_kv_storage_dims(self) -> tuple[int, int]:
+        if self.nsa_kv_cache_store_fp8 and not _is_hip:
+            nope_dim = self.kv_lora_rank + self.kv_lora_rank // self.quant_block_size * 4
+            rope_dim = self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
+            return nope_dim, rope_dim
+        return self.kv_lora_rank, self.qk_rope_head_dim
+
+    def _get_compact_kv_prefetch_buffers(
+        self, seq_len_sum: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.compact_kv_prefetch_nope_buffer.shape[0] >= seq_len_sum, (
+            "compact KV prefetch buffer is too small: "
+            f"capacity={self.compact_kv_prefetch_nope_buffer.shape[0]}, "
+            f"required={seq_len_sum}"
+        )
+        return (
+            self.compact_kv_prefetch_nope_buffer[:seq_len_sum],
+            self.compact_kv_prefetch_rope_buffer[:seq_len_sum],
+        )
+
+    def prefetch_kv_buffer(
+        self,
+        layer_id: int,
+        page_indices: torch.Tensor,
+        seq_len_sum: int,
+    ) -> None:
         if not self.layer_shard_enabled:
             return
-        if self.remote_kv_layer_id == layer_id:
-            return
         if getattr(self, "pending_remote_kv_broadcast", False):
-            if self.pending_remote_kv_layer_id == layer_id:
-                return
             # A single shared remote_kv_buffer is used for all layers.
             # Wait for previous prefetch before reusing it.
             self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
 
         local_idx = self._local_layer_idx(layer_id)
-        src_tensor = self.kv_buffer[local_idx] if self._is_layer_owned(layer_id) else None
         self.kv_broadcast_stream.wait_stream(self.device_module.current_stream())
         with self.device_module.stream(self.kv_broadcast_stream):
-            self._broadcast_tensor_from_owner(
-                self.remote_kv_buffer, layer_id, src_tensor=src_tensor
+            page_indices = page_indices.to(dtype=torch.long)
+            token_locs = (
+                page_indices.unsqueeze(-1) * self.page_size + self.page_offset_buffer
+            ).view(-1)
+            prefetch_token_num = token_locs.numel()
+            cache_k_nope, cache_k_rope = self._get_compact_kv_prefetch_buffers(
+                prefetch_token_num
             )
+
+            if self._is_layer_owned(layer_id) and prefetch_token_num > 0:
+                get_mla_kv_buffer_triton(
+                    self.kv_buffer[local_idx],
+                    token_locs,
+                    cache_k_nope,
+                    cache_k_rope,
+                )
+
+            cache_k_nope = self._broadcast_tensor_from_owner(
+                cache_k_nope,
+                layer_id,
+                src_tensor=cache_k_nope if self._is_layer_owned(layer_id) else None,
+            )
+            cache_k_rope = self._broadcast_tensor_from_owner(
+                cache_k_rope,
+                layer_id,
+                src_tensor=cache_k_rope if self._is_layer_owned(layer_id) else None,
+            )
+            if prefetch_token_num > 0:
+                set_mla_kv_buffer_triton(
+                    self.remote_kv_buffer,
+                    token_locs,
+                    cache_k_nope,
+                    cache_k_rope,
+                )
         self.pending_remote_kv_layer_id = layer_id
         self.pending_remote_kv_broadcast = True
 
@@ -2172,6 +2244,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
         page_indices: torch.Tensor,
         seq_len_sum: int,
         max_seq_len: int,
+        full_seq_len_tensor: Optional[torch.Tensor] = None,
+        full_page_indices: Optional[torch.Tensor] = None,
+        full_seq_len_sum: Optional[int] = None,
+        full_max_seq_len: Optional[int] = None,
+        loc: Optional[torch.Tensor] = None,
     ):
         """
         Fused method to get both index K and scale data in a single call using Triton.
@@ -2180,22 +2257,102 @@ class NSATokenToKVPool(MLATokenToKVPool):
         :param layer_id: Layer index
         :param seq_len: Sequence length
         :param page_indices: Page indices tensor
+        :param full_seq_len_tensor: Full-batch seq lens before CP batch filtering
+        :param full_page_indices: Full-batch page table before CP batch filtering
+        :param full_seq_len_sum: Sum of full-batch seq lens before CP batch filtering
+        :param full_max_seq_len: Max of full-batch seq lens before CP batch filtering
+        :param loc: Token locs for writing full-batch K/S into the remote index buffer
         :return: tuple of (k_fp8, k_scale) where
                  k_fp8: (seq_len, index_head_dim), uint8
                  k_scale: (seq_len, 4), uint8
         """
-        buf = self._get_broadcastable_index_buffer(layer_id)
-        # Start KV cache prefetch after index-buffer broadcast, then overlap it
-        # with the subsequent indexer compute.
-        self.prefetch_kv_buffer(layer_id)
-        return index_buf_accessor.GetKAndS.execute(
+        if not self.layer_shard_enabled:
+            buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+            return index_buf_accessor.GetKAndS.execute(
+                self,
+                buf,
+                page_indices=page_indices,
+                seq_len_tensor=seq_len_tensor,
+                seq_len_sum=seq_len_sum,
+                max_seq_len=max_seq_len,
+            )
+
+        if full_seq_len_tensor is None:
+            full_seq_len_tensor = seq_len_tensor
+        if full_page_indices is None:
+            full_page_indices = page_indices
+        if full_seq_len_sum is None:
+            full_seq_len_sum = seq_len_sum
+        if full_max_seq_len is None:
+            full_max_seq_len = max_seq_len
+        if loc is None:
+            raise ValueError("loc must be provided when layer_shard_enabled")
+
+        remote_buf = self.remote_index_k_with_scale_buffer
+        if self._is_layer_owned(layer_id):
+            buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+            full_k_fp8, full_k_scale = index_buf_accessor.GetKAndS.execute(
+                self,
+                buf,
+                page_indices=full_page_indices,
+                seq_len_tensor=full_seq_len_tensor,
+                seq_len_sum=full_seq_len_sum,
+                max_seq_len=full_max_seq_len,
+            )
+            src_full_k_fp8 = full_k_fp8
+            src_full_k_scale = full_k_scale
+        else:
+            full_k_fp8 = torch.empty(
+                (full_seq_len_sum, self.index_head_dim),
+                dtype=self.index_k_with_scale_buffer_dtype,
+                device=self.device,
+            )
+            full_k_scale = torch.empty(
+                (
+                    full_seq_len_sum,
+                    self.index_head_dim // self.quant_block_size * 4,
+                ),
+                dtype=self.index_k_with_scale_buffer_dtype,
+                device=self.device,
+            )
+            src_full_k_fp8 = None
+            src_full_k_scale = None
+
+        full_k_fp8 = self._broadcast_tensor_from_owner(
+            full_k_fp8, layer_id, src_tensor=src_full_k_fp8
+        )
+        full_k_scale = self._broadcast_tensor_from_owner(
+            full_k_scale, layer_id, src_tensor=src_full_k_scale
+        )
+        self.prefetch_kv_buffer(
+            layer_id,
+            page_indices=full_page_indices,
+            seq_len_sum=full_seq_len_sum,
+        )
+        if full_seq_len_sum > 0:
+            index_k_dtype = (
+                torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
+            )
+            if not loc.is_contiguous():
+                loc = loc.contiguous()
+            index_buf_accessor.SetKAndS.execute(
+                pool=self,
+                buf=remote_buf,
+                loc=loc,
+                index_k=full_k_fp8.view(index_k_dtype),
+                index_k_scale=full_k_scale.view(torch.float32),
+            )
+        self.remote_index_layer_id = layer_id
+
+        k_fp8, k_scale = index_buf_accessor.GetKAndS.execute(
             self,
-            buf,
+            remote_buf,
             page_indices=page_indices,
             seq_len_tensor=seq_len_tensor,
             seq_len_sum=seq_len_sum,
             max_seq_len=max_seq_len,
         )
+        return k_fp8, k_scale
 
     def set_index_k_scale_buffer(
         self,

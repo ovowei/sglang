@@ -102,6 +102,16 @@ class BaseIndexerMetadata(ABC):
         Return: seq lens for each batch.
         """
 
+    def get_indexer_seq_len_full(self) -> torch.Tensor:
+        """
+        Return: seq lens for the full batch before CP batch filtering.
+        """
+
+    def get_indexer_seq_len_cpu_full(self) -> torch.Tensor:
+        """
+        Return: seq lens for the full batch before CP batch filtering.
+        """
+
     def get_nsa_extend_len_cpu(self) -> List[int]:
         """
         Return: extend seq lens for each batch.
@@ -110,6 +120,11 @@ class BaseIndexerMetadata(ABC):
     def get_token_to_batch_idx(self) -> torch.Tensor:
         """
         Return: batch idx for each token.
+        """
+
+    def get_page_table_64_full(self) -> torch.Tensor:
+        """
+        Return: full-batch page table before CP batch filtering.
         """
 
     @abstractmethod
@@ -567,12 +582,23 @@ class Indexer(MultiPlatformOp):
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
+        full_indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu_full()
+        full_seq_len_sum = torch.sum(full_indexer_seq_lens_cpu).item()
+        full_max_seq_len = torch.max(full_indexer_seq_lens_cpu).item()
+        # loc for SetKAndS: token-level physical positions of every valid
+        # token in the full batch. Built once in init_forward_metadata.
+        full_loc = metadata.get_page_table_1_full_flattened()
         k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
             layer_id,
             metadata.get_indexer_seq_len(),
             block_tables,
             seq_len_sum,
             max_seq_len,
+            metadata.get_indexer_seq_len_full(),
+            metadata.get_page_table_64_full(),
+            full_seq_len_sum,
+            full_max_seq_len,
+            full_loc,
         )
         if _is_fp8_fnuz:
             k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)

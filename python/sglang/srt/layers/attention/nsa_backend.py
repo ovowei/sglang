@@ -142,6 +142,19 @@ class NSAMetadata:
     indexer_seq_lens_cpu: Optional[torch.Tensor] = None
     # seq lens for each batch.
     indexer_seq_lens: Optional[torch.Tensor] = None
+    # seq lens for each batch before CP batch filtering.
+    indexer_seq_lens_cpu_full: Optional[torch.Tensor] = None
+    # seq lens for each batch before CP batch filtering.
+    indexer_seq_lens_full: Optional[torch.Tensor] = None
+    # page table with page_size = 1 before CP batch filtering.
+    page_table_1_full: Optional[torch.Tensor] = None
+    # page table with page_size = 64 before CP batch filtering.
+    real_page_table_full: Optional[torch.Tensor] = None
+    # Layer-shard / cp scatter loc: 1D token-level physical locations of every
+    # valid token in the full batch (before cp round-robin-split). Used by
+    # get_index_k_scale_buffer's SetKAndS to scatter the broadcast full K/S
+    # back into the remote index buffer at the correct token positions.
+    page_table_1_full_flattened: Optional[torch.Tensor] = None
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
 
@@ -205,11 +218,23 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
     def get_indexer_seq_len_cpu(self) -> torch.Tensor:
         return self.attn_metadata.indexer_seq_lens_cpu
 
+    def get_indexer_seq_len_full(self) -> torch.Tensor:
+        return self.attn_metadata.indexer_seq_lens_full
+
+    def get_indexer_seq_len_cpu_full(self) -> torch.Tensor:
+        return self.attn_metadata.indexer_seq_lens_cpu_full
+
     def get_nsa_extend_len_cpu(self) -> List[int]:
         return self.attn_metadata.nsa_extend_seq_lens_list
 
     def get_token_to_batch_idx(self) -> torch.Tensor:
         return self.attn_metadata.token_to_batch_idx
+
+    def get_page_table_64_full(self) -> torch.Tensor:
+        return self.attn_metadata.real_page_table_full
+
+    def get_page_table_1_full_flattened(self) -> Optional[torch.Tensor]:
+        return self.attn_metadata.page_table_1_full_flattened
 
     def topk_transform(
         self,
@@ -422,6 +447,28 @@ class NativeSparseAttnBackend(
         # seq_len_cpu of selected sequences
         indexer_seq_lens_cpu = forward_batch.seq_lens_cpu
         indexer_seq_lens = forward_batch.seq_lens
+        full_indexer_seq_lens_cpu = indexer_seq_lens_cpu
+        full_indexer_seq_lens = indexer_seq_lens
+        full_page_table = page_table
+        # Build flattened token-level loc for the full batch. This is the
+        # destination address used when SetKAndS scatters broadcast full K/S
+        # into the remote index buffer in layer-shard mode.
+        # Only useful in extend mode (where indexer is run); cheap enough to
+        # always build when full_indexer_seq_lens_cpu is available.
+        full_page_table_1_flattened = None
+        if (
+            getattr(forward_batch.token_to_kv_pool, "layer_shard_enabled", False)
+            and full_indexer_seq_lens_cpu is not None
+            and len(full_indexer_seq_lens_cpu) > 0
+        ):
+            _kv_lens_cpu = full_indexer_seq_lens_cpu.tolist()
+            _slices = [
+                full_page_table[i, :kv_len]
+                for i, kv_len in enumerate(_kv_lens_cpu)
+                if kv_len > 0
+            ]
+            if _slices:
+                full_page_table_1_flattened = torch.cat(_slices).to(torch.int64)
 
         if forward_batch.forward_mode.is_decode_or_idle():
             extend_seq_lens_cpu = [1] * batch_size
@@ -662,6 +709,12 @@ class NativeSparseAttnBackend(
             indexer_k_start_end=indexer_k_start_end,
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
             indexer_seq_lens=indexer_seq_lens,
+            indexer_seq_lens_cpu_full=full_indexer_seq_lens_cpu,
+            indexer_seq_lens_full=full_indexer_seq_lens,
+            page_table_1_full=full_page_table,
+            real_page_table_full=self._transform_table_1_to_real(full_page_table),
+            page_table_1_full_flattened=full_page_table_1_flattened
+                if "full_page_table_1_flattened" in dir() else None,
             token_to_batch_idx=token_to_batch_idx,
         )
         self.forward_metadata = metadata
