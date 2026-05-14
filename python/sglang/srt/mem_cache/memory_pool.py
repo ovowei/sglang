@@ -1852,9 +1852,13 @@ class MLATokenToKVPool(KVCache):
     def prefetch_kv_buffer(
         self,
         layer_id: int,
-        page_indices: torch.Tensor,
-        seq_len_sum: int,
+        token_locs: torch.Tensor,
     ) -> None:
+        # ``token_locs`` is a 1-D token-level loc tensor (padding already
+        # masked out by the caller), identical in shape/dtype to the ``loc``
+        # passed to SetKAndS in the INDEX-K path. Deriving token_locs from a
+        # ``(batch, max_pages)`` page table here would include padding slots
+        # and dereference into garbage in get/set_mla_kv_buffer_triton.
         if not self.layer_shard_enabled:
             return
         if getattr(self, "pending_remote_kv_broadcast", False):
@@ -1865,10 +1869,10 @@ class MLATokenToKVPool(KVCache):
         local_idx = self._local_layer_idx(layer_id)
         self.kv_broadcast_stream.wait_stream(self.device_module.current_stream())
         with self.device_module.stream(self.kv_broadcast_stream):
-            page_indices = page_indices.to(dtype=torch.long)
-            token_locs = (
-                page_indices.unsqueeze(-1) * self.page_size + self.page_offset_buffer
-            ).view(-1)
+            if token_locs.dtype != torch.long:
+                token_locs = token_locs.to(dtype=torch.long)
+            if not token_locs.is_contiguous():
+                token_locs = token_locs.contiguous()
             prefetch_token_num = token_locs.numel()
             cache_k_nope, cache_k_rope = self._get_compact_kv_prefetch_buffers(
                 prefetch_token_num
@@ -2324,11 +2328,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
         full_k_scale = self._broadcast_tensor_from_owner(
             full_k_scale, layer_id, src_tensor=src_full_k_scale
         )
-        self.prefetch_kv_buffer(
-            layer_id,
-            page_indices=full_page_indices,
-            seq_len_sum=full_seq_len_sum,
-        )
+        # ``loc`` here is the same full-batch, padding-masked, token-level
+        # loc tensor we feed to the INDEX-K SetKAndS below — reuse it for
+        # the MLA-KV broadcast scatter so both paths address identical token
+        # slots and we don't deref padding page entries.
+        self.prefetch_kv_buffer(layer_id, token_locs=loc)
         if full_seq_len_sum > 0:
             index_k_dtype = (
                 torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
