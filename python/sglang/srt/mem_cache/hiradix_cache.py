@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.radix_cache import (
+    InsertAndGetResult,
     RadixCache,
     RadixKey,
     TreeNode,
@@ -1532,6 +1533,124 @@ class HiRadixCache(RadixCache):
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
         return InsertResult(prefix_len=total_prefix_length)
+
+    def insert_and_get_indices(self, params: InsertParams) -> InsertAndGetResult:
+        """HiRadixCache version of the fused insert + collect-indices walk.
+
+        Mirrors ``HiRadixCache.insert`` so every hicache-specific side effect
+        (evicted-node repopulate, hash_value, BlockStored event, write-policy
+        hit-count gating, leaf/host_leaf status maintenance) still runs, while
+        also collecting each touched node's device value into ``matched_values``
+        for a single ``torch.cat`` at the end.
+
+        After this returns, every node on the walked path has a non-None
+        device ``value`` (matched-on-device nodes kept theirs, evicted nodes
+        got repopulated, the new tail node was just cloned), so
+        ``torch.cat(matched_values).numel() == len(page_aligned_key)``.
+        """
+        key = params.key
+        value = params.value
+        chunked = params.chunked
+        priority = params.priority
+
+        if priority is None:
+            priority = 0
+
+        key, value = key.maybe_to_bigram_view(self.is_eagle, value)
+        key = key.page_aligned(self.page_size)
+        if value is not None:
+            value = value[: len(key)]
+
+        original_key_len = len(key)
+
+        if original_key_len == 0:
+            empty = torch.empty((0,), dtype=torch.int64, device=self.device)
+            return InsertAndGetResult(
+                prefix_len=0, device_indices=empty, last_device_node=self.root_node
+            )
+
+        node = self.root_node
+        child_key = key.child_key(self.page_size)
+        total_prefix_length = 0
+        matched_values: List[torch.Tensor] = []
+
+        while len(key) > 0 and child_key in node.children.keys():
+            node = node.children[child_key]
+            node.last_access_time = time.monotonic()
+            node.priority = max(node.priority, priority)
+            prefix_len = node.key.match(key, page_size=self.page_size)
+
+            if prefix_len == len(node.key):
+                if node.evicted:
+                    # Repopulate device value for a host-only node before we
+                    # append it to matched_values; otherwise the appended
+                    # tensor would be None and torch.cat would crash.
+                    node.value = value[:prefix_len].clone()
+                    self.evictable_size_ += len(node.value)
+                    self._update_leaf_status(node)
+                    self._update_host_leaf_status(node)
+                    self._update_leaf_status(node.parent)
+                else:
+                    self._inc_hit_count(node, chunked)
+                    total_prefix_length += prefix_len
+                matched_values.append(node.value)
+            else:
+                # Partial match: split the node first, then handle the
+                # newly-formed prefix node exactly like a matched node.
+                new_node = self._split_node(node.key, node, prefix_len)
+                new_node.priority = max(new_node.priority, priority)
+                if new_node.evicted:
+                    new_node.value = value[:prefix_len].clone()
+                    self.evictable_size_ += len(new_node.value)
+                    self._update_leaf_status(new_node)
+                    self._update_host_leaf_status(new_node)
+                    self._update_leaf_status(new_node.parent)
+                else:
+                    self._inc_hit_count(new_node, chunked)
+                    total_prefix_length += prefix_len
+                matched_values.append(new_node.value)
+                node = new_node
+
+            key = key[prefix_len:]
+            value = value[prefix_len:]
+
+            if len(key):
+                child_key = key.child_key(self.page_size)
+
+        if len(key):
+            new_node = TreeNode(priority=priority)
+            new_node.parent = node
+            new_node.key = key
+            new_node.value = value.clone()
+            node.children[child_key] = new_node
+            self.evictable_size_ += len(value)
+            self._update_leaf_status(node)
+            self._update_leaf_status(new_node)
+
+            if self.enable_storage or self.enable_kv_cache_events:
+                new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
+
+            self._record_store_event(new_node)
+
+            if self.cache_controller.write_policy != "write_back":
+                self._inc_hit_count(new_node, chunked)
+
+            matched_values.append(new_node.value)
+            node = new_node
+
+        device_indices = (
+            torch.cat(matched_values)
+            if matched_values
+            else torch.empty((0,), dtype=torch.int64, device=self.device)
+        )
+        assert (
+            len(device_indices) == original_key_len
+        ), f"{len(device_indices)=}, {original_key_len=}"
+        return InsertAndGetResult(
+            prefix_len=total_prefix_length,
+            device_indices=device_indices,
+            last_device_node=node,
+        )
 
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request

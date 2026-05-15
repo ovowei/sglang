@@ -566,7 +566,9 @@ class SchedulerDisaggregationPrefillMixin:
                         # Grammar accept_token can raise ValueError if the token is not in the grammar.
                         # This can happen if the grammar is not set correctly or the token is invalid.
                         error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                        release_kv_cache(req, self.tree_cache)
+                        # cache_unfinished_req already inserted the prefix into
+                        # the radix tree above, so skip the redundant re-insert.
+                        release_kv_cache(req, self.tree_cache, is_insert=False)
                         prepare_abort(
                             req,
                             error_message,
@@ -649,7 +651,10 @@ class SchedulerDisaggregationPrefillMixin:
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
+                # The prefix is already in the radix tree (cache_unfinished_req
+                # ran in process_batch_result_disagg_prefill); skip the
+                # redundant insert in cache_finished_req and only unlock.
+                release_kv_cache(req, self.tree_cache, is_insert=False)
                 req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
                 if hasattr(req.disagg_kv_sender, "clear"):
@@ -664,7 +669,9 @@ class SchedulerDisaggregationPrefillMixin:
                     error_message += f" with exception {e}"
                 logger.warning(error_message)
                 req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
+                # cache_unfinished_req already inserted the prefix; skip the
+                # redundant re-insert here and only unlock + free overalloc KV.
+                release_kv_cache(req, self.tree_cache, is_insert=False)
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )

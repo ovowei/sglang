@@ -21,6 +21,7 @@ limitations under the License.
 The radix tree data structure for managing the KV cache.
 """
 
+import dataclasses
 import hashlib
 import heapq
 import logging
@@ -66,6 +67,13 @@ from sglang.srt.mem_cache.utils import hash_str_to_int64
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+
+
+@dataclasses.dataclass
+class InsertAndGetResult:
+    prefix_len: int
+    device_indices: torch.Tensor
+    last_device_node: Any
 
 
 class RadixKey:
@@ -485,6 +493,57 @@ class RadixCache(BasePrefixCache):
         prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
         return InsertResult(prefix_len=prefix_len)
 
+    def insert_and_get_indices(self, params: InsertParams) -> InsertAndGetResult:
+        """Single-pass insert that also returns the canonical device_indices.
+
+        Equivalent to calling ``self.insert(params)`` immediately followed by
+        ``self.match_prefix(MatchPrefixParams(key=params.key))``. Used by
+        ``cache_unfinished_req`` to fold two trie traversals into one. After
+        this returns, every node on the matched path has a non-None ``value``,
+        so ``torch.cat(matched_values) == device_indices`` and its length
+        equals ``len(page_aligned_key)``.
+        """
+        if self.disable:
+            empty = torch.empty((0,), dtype=torch.int64, device=self.device)
+            return InsertAndGetResult(
+                prefix_len=0, device_indices=empty, last_device_node=self.root_node
+            )
+
+        key = params.key
+        value = params.value
+        priority = params.priority
+        chunked = params.chunked
+
+        key, value = key.maybe_to_bigram_view(self.is_eagle, value)
+        key = key.page_aligned(self.page_size)
+        if value is not None:
+            value = value[: len(key)]
+        else:
+            value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
+
+        if len(key) == 0:
+            empty = torch.empty((0,), dtype=torch.int64, device=self.device)
+            return InsertAndGetResult(
+                prefix_len=0, device_indices=empty, last_device_node=self.root_node
+            )
+
+        prefix_len, matched_values, last_node = self._insert_helper_with_result(
+            self.root_node, key, value, priority, chunked
+        )
+        device_indices = (
+            torch.cat(matched_values)
+            if matched_values
+            else torch.empty((0,), dtype=torch.int64, device=self.device)
+        )
+        assert len(device_indices) == len(
+            key
+        ), f"{len(device_indices)=}, {len(key)=}"
+        return InsertAndGetResult(
+            prefix_len=prefix_len,
+            device_indices=device_indices,
+            last_device_node=last_node,
+        )
+
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
         # In deterministic mode, disable finished request insertion to radix cache
@@ -547,8 +606,10 @@ class RadixCache(BasePrefixCache):
         ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 
-        # Radix Cache takes one ref in memory pool
-        result = self.insert(
+        # Single-pass insert + collect canonical device_indices. Replaces the
+        # old ``self.insert(...)`` followed by ``self.match_prefix(...)`` so
+        # the trie is traversed once per cache_unfinished_req.
+        result = self.insert_and_get_indices(
             InsertParams(
                 key=radix_key,
                 value=values,
@@ -557,17 +618,13 @@ class RadixCache(BasePrefixCache):
             )
         )
         new_prefix_len = result.prefix_len
+        new_indices = result.device_indices
+        new_last_node = result.last_device_node
 
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.cache_protected_len : new_prefix_len]
         )
 
-        # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
-        new_indices, new_last_node = (
-            match_result.device_indices,
-            match_result.last_device_node,
-        )
         assert len(new_indices) == len(
             radix_key
         ), f"{len(new_indices)=}, {len(radix_key)=}"
@@ -799,6 +856,70 @@ class RadixCache(BasePrefixCache):
             # Hash will be computed lazily during event emission
             self._record_store_event(new_node)
         return total_prefix_length
+
+    def _insert_helper_with_result(
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        value,
+        priority: int = 0,
+        chunked: bool = False,
+    ):
+        """Same trie walk as ``_insert_helper`` but also collects the value
+        tensor of every visited node so the caller can ``torch.cat`` them into
+        a canonical ``device_indices`` tensor without a separate match_prefix
+        traversal. After this returns, every appended ``value`` is non-None
+        because either (a) the matched/split node was already on-device or
+        (b) the new tail node we just created carries a fresh ``value.clone()``.
+        """
+        if priority is None:
+            priority = 0
+        access_time = time.monotonic()
+        node.last_access_time = access_time
+        node.priority = max(node.priority, priority)
+        if len(key) == 0:
+            return 0, [], node
+
+        child_key = key.child_key(self.page_size)
+        total_prefix_length = 0
+        matched_values = []
+
+        while len(key) > 0 and child_key in node.children.keys():
+            node = node.children[child_key]
+            node.last_access_time = access_time
+            prefix_len = node.key.match(key, page_size=self.page_size)
+            total_prefix_length += prefix_len
+            key = key[prefix_len:]
+            value = value[prefix_len:]
+
+            if prefix_len < len(node.key):
+                new_node = self._split_node(node.key, node, prefix_len)
+                new_node.priority = max(new_node.priority, priority)
+                self._inc_hit_count(new_node, chunked)
+                node = new_node
+                matched_values.append(new_node.value)
+            else:
+                node.priority = max(node.priority, priority)
+                self._inc_hit_count(node, chunked)
+                matched_values.append(node.value)
+            if len(key):
+                child_key = key.child_key(self.page_size)
+
+        if len(key):
+            new_node = TreeNode(priority=priority)
+            new_node.parent = node
+            new_node.key = key
+            new_node.value = value.clone()
+            self._inc_hit_count(new_node, chunked)
+            node.children[child_key] = new_node
+            self.evictable_size_ += len(key)
+            self._update_leaf_status(node)
+            self._update_leaf_status(new_node)
+            self._record_store_event(new_node)
+            matched_values.append(new_node.value)
+            node = new_node
+
+        return total_prefix_length, matched_values, node
 
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""
