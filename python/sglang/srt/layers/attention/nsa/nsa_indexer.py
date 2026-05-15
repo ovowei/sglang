@@ -514,53 +514,21 @@ class Indexer(MultiPlatformOp):
     def _should_chunk_mqa_logits(
         self, num_q: int, num_k: int, device: torch.device
     ) -> Tuple[bool, int]:
-        """Detect whether we need to chunk the MQA logits to avoid OOM.
-
-        ``torch.cuda.mem_get_info`` only returns OS-level free memory; it
-        excludes blocks that PyTorch's caching allocator has reserved but
-        already returned to its internal pool (visible as "used" in
-        ``nvidia-smi``). Those blocks can be handed back out to a new
-        ``torch.empty`` without growing the process footprint, so they are
-        effectively free for the next ``fp8_mqa_logits`` allocation.
-
-        Treating them as unavailable made the chunk decision overly
-        conservative once layer-shard pre-allocated several large buffers
-        (``remote_kv_buffer``, ``compact_kv_prefetch_*``): the OS view shows
-        only a few GB free, but the caching pool typically has tens of GB
-        ready to reuse, and we still end up cutting Q into many chunks per
-        ``_get_topk_ragged`` call (the trace shows ~50 chunks per call under
-        high-cache-hit batches).
-
-        Add the pool's reservable headroom (discounted for fragmentation) to
-        the OS-free figure so the heuristic matches the allocator's actual
-        capacity.
+        """
+        Detect whether we need to chunk the MQA logits computation to avoid OOM
+        Return: (need_chunk, free_mem)
         """
         # Quick static check for normal batches
         if num_q * num_k < 8_000_000:  # 8M elements ≈ 32MB logits
             return False, 0
 
-        # OS-level free (nvidia-smi view): blocks reserved but unused by the
-        # caching allocator still count as taken here.
-        free_mem_os, total_mem = torch.cuda.mem_get_info(device)
-        # Caching allocator's reservable headroom: reserved - allocated is the
-        # pool of freed blocks that ``torch.empty`` can reuse without asking
-        # the OS for more memory.
-        reserved = torch.cuda.memory_reserved(device)
-        allocated = torch.cuda.memory_allocated(device)
-        free_in_pool = max(0, reserved - allocated)
-        # 0.7 discount avoids false confidence from fragmentation: a pool
-        # split into many small free blocks won't necessarily satisfy a large
-        # contiguous logits tensor.
-        effective_free = free_mem_os + int(free_in_pool * 0.7)
-
+        free_mem, total_mem = torch.cuda.mem_get_info(device)
         bytes_per_elem = 4  # float32
         logits_bytes = num_q * num_k * bytes_per_elem
 
-        # Logits should not exceed 50% of effective free memory or 30% of total memory
-        need_chunk = (logits_bytes * 2 > effective_free) or (
-            logits_bytes > total_mem * 0.3
-        )
-        return need_chunk, effective_free
+        # Logits should not exceed 50% of free memory or 30% of total memory
+        need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
+        return need_chunk, free_mem
 
     def _get_topk_ragged(
         self,
