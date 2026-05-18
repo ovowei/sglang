@@ -433,6 +433,14 @@ def cutlass_moe_fp4(
     out_dtype = a.dtype
     num_topk = topk_ids.shape[1]
     device = a.device
+    # EP local mapping uses -1 for experts owned by other ranks. The CUTLASS
+    # input-prep kernel requires valid local ids, so route those placeholder
+    # entries to expert 0 with zero weight; other EP ranks contribute the real
+    # local expert outputs before the final all-reduce. Keep this branch-free
+    # because the function is used during CUDA graph capture.
+    remote_expert_mask = topk_ids < 0
+    topk_ids = topk_ids.masked_fill(remote_expert_mask, 0)
+    topk_weights = topk_weights.masked_fill(remote_expert_mask, 0)
     a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
     c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
     prepare_moe_input(
