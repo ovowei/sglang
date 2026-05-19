@@ -1553,6 +1553,19 @@ class GetInternalStateReqOutput(BaseReq):
 
 
 @dataclass
+class GetRunningReqsReq(BaseReq):
+    pass
+
+
+@dataclass
+class GetRunningReqsReqOutput(BaseReq):
+    # One entry per request currently in the running batch on this DP rank.
+    # Each entry is a dict with: rid, input_len, output_len,
+    # spec_verify_ct, spec_accepted_tokens, accept_length.
+    running_reqs: List[Dict[str, Any]]
+
+
+@dataclass
 class SetInternalStateReq(BaseReq):
     server_args: Dict[str, Any]
 

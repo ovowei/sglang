@@ -49,6 +49,8 @@ from sglang.srt.managers.io_struct import (
     GetLoadReqOutput,
     GetLoadsReqInput,
     GetLoadsReqOutput,
+    GetRunningReqsReq,
+    GetRunningReqsReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -235,6 +237,9 @@ class TokenizerCommunicatorMixin:
         self.get_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.get_running_reqs_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.set_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -342,6 +347,10 @@ class TokenizerCommunicatorMixin:
                 (
                     GetInternalStateReqOutput,
                     self.get_internal_state_communicator.handle_recv,
+                ),
+                (
+                    GetRunningReqsReqOutput,
+                    self.get_running_reqs_communicator.handle_recv,
                 ),
                 (
                     SetInternalStateReqOutput,
@@ -981,6 +990,17 @@ class TokenizerCommunicatorMixin:
         )
         # Many DP ranks
         return [res.internal_state for res in responses]
+
+    async def get_running_reqs(
+        self: TokenizerManager,
+    ) -> List[List[Dict[str, Any]]]:
+        """One inner list per DP rank, each containing per-request live stats."""
+        self.auto_create_handle_loop()
+        req = GetRunningReqsReq()
+        responses: List[GetRunningReqsReqOutput] = (
+            await self.get_running_reqs_communicator(req)
+        )
+        return [res.running_reqs for res in responses]
 
     async def set_internal_state(
         self: TokenizerManager, obj: SetInternalStateReq

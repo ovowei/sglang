@@ -618,6 +618,41 @@ async def server_info():
     }
 
 
+@app.get("/get_running_reqs")
+async def get_running_reqs():
+    """Return per-request live stats for every request currently in the
+    running batch, including speculative-decoding acceptance counters.
+
+    Output schema:
+    {
+      "running_reqs": [
+        {
+          "dp_rank": int,
+          "rid": str,
+          "bootstrap_room": int | None,
+          "input_len": int,
+          "output_len": int,
+          "spec_verify_ct": int,
+          "spec_accepted_tokens": int,
+          "accept_length": float,
+        },
+        ...
+      ],
+      "total": int,
+    }
+    """
+    per_rank: List[List[Dict[str, Any]]] = (
+        await _global_state.tokenizer_manager.get_running_reqs()
+    )
+    flat: List[Dict[str, Any]] = []
+    for dp_rank, reqs in enumerate(per_rank):
+        for r in reqs:
+            r = dict(r)
+            r["dp_rank"] = dp_rank
+            flat.append(r)
+    return {"running_reqs": flat, "total": len(flat)}
+
+
 @app.get("/get_load")
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead)."""

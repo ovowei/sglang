@@ -111,6 +111,8 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     GetLoadReqInput,
     GetLoadsReqInput,
+    GetRunningReqsReq,
+    GetRunningReqsReqOutput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -1273,6 +1275,7 @@ class Scheduler(
                 (ProfileReq, self.profile),
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
+                (GetRunningReqsReq, self.get_running_reqs),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
@@ -3165,6 +3168,35 @@ class Scheduler(
         ret.pop("model_config", None)
 
         return GetInternalStateReqOutput(internal_state=ret)
+
+    def get_running_reqs(self, recv_req: GetRunningReqsReq):
+        """Return per-request live stats for every request currently in the
+        running batch (spec-decoding acceptance counters + output length).
+
+        The HTTP-side wrapper flattens this across DP ranks; the scheduler
+        only sees its own running_batch.
+        """
+        out: List[Dict[str, Any]] = []
+        for req in self.running_batch.reqs:
+            verify_ct = int(req.spec_verify_ct)
+            accepted = int(req.spec_accepted_tokens)
+            # accept_length includes the bonus token (paper convention):
+            # tokens_emitted_per_verify_step = (accepted_drafts + 1 bonus) / verify_ct
+            accept_length = (
+                (accepted + verify_ct) / verify_ct if verify_ct > 0 else 0.0
+            )
+            out.append(
+                {
+                    "rid": req.rid,
+                    "bootstrap_room": getattr(req, "bootstrap_room", None),
+                    "input_len": len(req.origin_input_ids),
+                    "output_len": len(req.output_ids),
+                    "spec_verify_ct": verify_ct,
+                    "spec_accepted_tokens": accepted,
+                    "accept_length": accept_length,
+                }
+            )
+        return GetRunningReqsReqOutput(running_reqs=out)
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
