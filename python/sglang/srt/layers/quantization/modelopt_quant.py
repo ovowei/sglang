@@ -2105,13 +2105,34 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_input_scale = layer.w2_input_scale
 
             if layer.moe_ep_size > 1:
-                assert (
-                    layer.moe_ep_size * layer.num_local_experts == layer.num_experts
-                )
-                expert_start = layer.moe_ep_rank * layer.num_local_experts
-                expert_end = expert_start + layer.num_local_experts
-                w13_input_scale = w13_input_scale[expert_start:expert_end]
-                w2_input_scale = w2_input_scale[expert_start:expert_end]
+                num_local_shared = getattr(layer, "num_fused_shared_experts", 0)
+                num_local_routed = layer.num_local_experts - num_local_shared
+                num_global_routed = layer.num_experts - num_local_shared
+                assert num_global_routed == layer.moe_ep_size * num_local_routed
+
+                expert_start = layer.moe_ep_rank * num_local_routed
+                expert_end = expert_start + num_local_routed
+                if num_local_shared:
+                    shared_start = layer.num_experts - num_local_shared
+                    local_experts = torch.cat(
+                        (
+                            torch.arange(
+                                expert_start,
+                                expert_end,
+                                device=w13_input_scale.device,
+                            ),
+                            torch.arange(
+                                shared_start,
+                                layer.num_experts,
+                                device=w13_input_scale.device,
+                            ),
+                        )
+                    )
+                    w13_input_scale = w13_input_scale[local_experts]
+                    w2_input_scale = w2_input_scale[local_experts]
+                else:
+                    w13_input_scale = w13_input_scale[expert_start:expert_end]
+                    w2_input_scale = w2_input_scale[expert_start:expert_end]
 
         # Create shared parameters
         copy_or_rebind_param(

@@ -9,8 +9,6 @@ from sglang.srt.distributed import (
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
-    get_moe_ep_group,
-    get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_rank,
     get_moe_tensor_parallel_world_size,
@@ -469,6 +467,35 @@ def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManage
     )
 
 
+def _select_allreduce_fusion_group(use_attn_tp_group: bool):
+    """Select the communication group for fused allreduce.
+
+    The post-MoE fusion replaces DeepSeek/Kimi's full TP all-reduce before the
+    next layernorm. With EP enabled, reducing only the EP group misses the MoE-TP
+    dimension and corrupts the next layer input.
+    """
+    if use_attn_tp_group:
+        return (
+            get_attn_tensor_model_parallel_world_size(),
+            get_attn_tensor_model_parallel_rank(),
+            get_attn_tp_group(),
+        )
+
+    if get_moe_expert_parallel_world_size() > 1:
+        tp_coordinator = get_tp_group()
+        return (
+            tp_coordinator.world_size,
+            tp_coordinator.rank_in_group,
+            tp_coordinator,
+        )
+
+    return (
+        get_moe_tensor_parallel_world_size(),
+        get_moe_tensor_parallel_rank(),
+        get_moe_tp_group(),
+    )
+
+
 def _sync_allreduce_unavailable_across_tp():
     """Synchronize _flashinfer_allreduce_unavailable across all TP ranks.
 
@@ -517,19 +544,7 @@ def ensure_workspace_initialized(
 
     tp_coordinator = get_tp_group()
 
-    if use_attn_tp_group:
-        world_size = get_attn_tensor_model_parallel_world_size()
-        rank = get_attn_tensor_model_parallel_rank()
-        coordinator = get_attn_tp_group()
-    else:
-        if get_moe_expert_parallel_world_size() > 1:
-            world_size = get_moe_expert_parallel_world_size()
-            rank = get_moe_expert_parallel_rank()
-            coordinator = get_moe_ep_group()
-        else:
-            world_size = get_moe_tensor_parallel_world_size()
-            rank = get_moe_tensor_parallel_rank()
-            coordinator = get_moe_tp_group()
+    world_size, rank, coordinator = _select_allreduce_fusion_group(use_attn_tp_group)
 
     # When the sub-group IS the full TP group, pass None so the workspace
     # uses the default process group directly (no TorchDistBackend needed).
@@ -632,16 +647,7 @@ def flashinfer_allreduce_residual_rmsnorm(
         )
         return None, None
 
-    if use_attn_tp_group:
-        world_size = get_attn_tensor_model_parallel_world_size()
-    else:
-        # If MoE expert parallel world size > 1, use expert parallel group
-        # Otherwise, use tensor parallel group
-        # The two values cannot be larger than 1 at the same time
-        if get_moe_expert_parallel_world_size() > 1:
-            world_size = get_moe_expert_parallel_world_size()
-        else:
-            world_size = get_moe_tensor_parallel_world_size()
+    world_size, _, _ = _select_allreduce_fusion_group(use_attn_tp_group)
 
     if world_size <= 1:
         logger.debug("Single GPU, no need for allreduce fusion")

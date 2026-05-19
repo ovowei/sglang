@@ -26,6 +26,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
+    get_moe_expert_parallel_world_size,
     moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
@@ -527,7 +528,14 @@ class LayerCommunicator:
                         )
                     )
                 else:
-                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+                    if get_moe_expert_parallel_world_size() > 1:
+                        hidden_states = tensor_model_parallel_all_reduce(
+                            hidden_states
+                        )
+                    else:
+                        hidden_states = moe_tensor_model_parallel_all_reduce(
+                            hidden_states
+                        )
                     hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
                     )
