@@ -3283,6 +3283,7 @@ def get_model_loader(
             "modelopt_fp8",
             "modelopt_fp4",
             "modelopt_mixed",
+            "glm_mixed_moe",
             "kimi_mixed_moe",
             "modelopt",
         ]
@@ -3295,7 +3296,13 @@ def get_model_loader(
         model_optloader_allowed
         and hasattr(model_config, "quantization")
         and model_config.quantization
-        in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "kimi_mixed_moe"]
+        in [
+            "modelopt_fp8",
+            "modelopt_fp4",
+            "modelopt_mixed",
+            "glm_mixed_moe",
+            "kimi_mixed_moe",
+        ]
     ):
         if model_config._is_already_quantized():
             logger.info(

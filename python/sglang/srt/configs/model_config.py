@@ -915,6 +915,8 @@ class ModelConfig:
 
         if quant_algo in ("KIMI_MIXED_MOE", "KIMI_MIXED_MOE_NVFP4_INT4"):
             return {"quant_method": "kimi_mixed_moe", "quant_algo": quant_algo}
+        elif quant_algo in ("GLM_MIXED_MOE", "GLM_MIXED_MOE_NVFP4_FP8"):
+            return {"quant_method": "glm_mixed_moe", "quant_algo": quant_algo}
         elif quant_algo == "MIXED_PRECISION":
             architectures = getattr(self.hf_config, "architectures", []) or []
             if getattr(self.hf_config, "model_type", None) == "nemotron_h" or any(
@@ -978,6 +980,10 @@ class ModelConfig:
             raise ValueError(
                 "kimi_mixed_moe is only supported for pre-quantized checkpoints."
             )
+        elif self.quantization == "glm_mixed_moe":
+            raise ValueError(
+                "glm_mixed_moe is only supported for pre-quantized checkpoints."
+            )
         elif self.quantization == "modelopt":
             # Auto-detect from model config
             quant_cfg = self._parse_quant_hf_config()
@@ -1010,6 +1016,7 @@ class ModelConfig:
             "modelopt_fp8",
             "modelopt_fp4",
             "modelopt_mixed",
+            "glm_mixed_moe",
             "kimi_mixed_moe",
         ]
         modelopt_quantization_specified = (
@@ -1053,6 +1060,7 @@ class ModelConfig:
             "modelopt_fp8",
             "modelopt_fp4",
             "modelopt_mixed",
+            "glm_mixed_moe",
             "kimi_mixed_moe",
             "gptq_marlin_24",
             "gptq_marlin",
@@ -1074,6 +1082,7 @@ class ModelConfig:
             "modelopt_fp8": ["modelopt"],
             "modelopt_fp4": ["modelopt"],
             "modelopt_mixed": ["modelopt"],
+            "glm_mixed_moe": ["modelopt", "modelopt_fp4"],
             "kimi_mixed_moe": ["modelopt"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
@@ -1104,15 +1113,24 @@ class ModelConfig:
                 "quant_method", "" if not self.quantization else self.quantization
             ).lower()
 
-            # Detect which checkpoint is it
-            for _, method in QUANTIZATION_METHODS.items():
-                quantization_override = method.override_quantization_method(
-                    quant_cfg, self.quantization
-                )
-                if quantization_override:
-                    quant_method = quantization_override
-                    self.quantization = quantization_override
-                    break
+            # Detect which checkpoint is it. If the user explicitly selects a
+            # compatible specialization such as glm_mixed_moe for a raw ModelOpt
+            # NVFP4 checkpoint, keep that specialization instead of letting the
+            # generic modelopt_fp4 override claim it first.
+            is_cli_quantization_compatible = (
+                self.quantization in compatible_quantization_methods
+                and quant_method
+                in compatible_quantization_methods[self.quantization]
+            )
+            if not is_cli_quantization_compatible:
+                for _, method in QUANTIZATION_METHODS.items():
+                    quantization_override = method.override_quantization_method(
+                        quant_cfg, self.quantization
+                    )
+                    if quantization_override:
+                        quant_method = quantization_override
+                        self.quantization = quantization_override
+                        break
 
             # Verify quantization configurations.
             if self.quantization is None:

@@ -477,6 +477,8 @@ class DeepseekV2WeightLoaderMixin:
                     self.quant_config, "linear_fp8_config", None
                 )
                 if selected_quant_config is None:
+                    selected_quant_config = getattr(self.quant_config, "fp8_config", None)
+                if selected_quant_config is None:
                     selected_quant_config = self.quant_config
                 weight_block_size = getattr(
                     selected_quant_config, "weight_block_size", None
@@ -503,7 +505,7 @@ class DeepseekV2WeightLoaderMixin:
                     if (
                         should_deepgemm_weight_requant_ue8m0(
                             weight_block_size=getattr(
-                                self.quant_config, "weight_block_size", None
+                                selected_quant_config, "weight_block_size", None
                             )
                         )
                         and weight_scale.format_ue8m0

@@ -580,6 +580,13 @@ class DeepseekV2MoE(nn.Module):
                 ):
                     # For compressed-tensors ptpc model, don't need to check the weight_block_size
                     pass
+                elif not hasattr(
+                    self.shared_experts.gate_up_proj.quant_method.quant_config,
+                    "weight_block_size",
+                ):
+                    # ModelOpt FP8 shared experts do not expose a block-size field.
+                    # They run through the regular linear path when fusion is disabled.
+                    pass
                 else:
                     assert (
                         self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
