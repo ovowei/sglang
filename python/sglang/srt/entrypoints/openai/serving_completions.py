@@ -165,19 +165,27 @@ class OpenAIServingCompletion(OpenAIServingBase):
         }
 
         # Handle response_format constraints
-        if request.response_format and request.response_format.type == "json_schema":
-            sampling_params["json_schema"] = convert_json_schema_to_str(
-                request.response_format.json_schema.schema_
-            )
-        elif request.response_format and request.response_format.type == "json_object":
-            sampling_params["json_schema"] = '{"type": "object"}'
-        elif (
-            request.response_format and request.response_format.type == "structural_tag"
+        #if request.response_format and request.response_format.type == "json_schema":
+        #    sampling_params["json_schema"] = convert_json_schema_to_str(
+        #        request.response_format.json_schema.schema_
+        #    )
+        #elif request.response_format and request.response_format.type == "json_object":
+        #    sampling_params["json_schema"] = '{"type": "object"}'
+        #elif (
+        #    request.response_format and request.response_format.type == "structural_tag"
+        #):
+        #    sampling_params["structural_tag"] = convert_json_schema_to_str(
+        #        request.response_format.model_dump(by_alias=True)
+        #    )
+        if request.response_format and request.response_format.type in (
+            "json_schema",
+            "json_object",
+            "structural_tag",
         ):
-            sampling_params["structural_tag"] = convert_json_schema_to_str(
-                request.response_format.model_dump(by_alias=True)
+            logger.warning(
+                "Ignoring response_format.type=%s to bypass grammar constrained decoding.",
+                request.response_format.type,
             )
-
         return sampling_params
 
     async def _handle_streaming_request(

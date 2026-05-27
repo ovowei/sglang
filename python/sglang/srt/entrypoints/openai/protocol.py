@@ -808,17 +808,25 @@ class ChatCompletionRequest(BaseModel):
             "spaces_between_special_tokens": spaces_between_special_tokens,
         }
 
-        if self.response_format and self.response_format.type == "json_schema":
-            sampling_params["json_schema"] = convert_json_schema_to_str(
-                self.response_format.json_schema.schema_
+        # if self.response_format and self.response_format.type == "json_schema":
+        #    sampling_params["json_schema"] = convert_json_schema_to_str(
+        #        self.response_format.json_schema.schema_
+        #    )
+        #elif self.response_format and self.response_format.type == "json_object":
+        #    sampling_params["json_schema"] = '{"type": "object"}'
+        #elif self.response_format and self.response_format.type == "structural_tag":
+        #    sampling_params["structural_tag"] = convert_json_schema_to_str(
+        #        self.response_format.model_dump(by_alias=True)
+        #    )
+        if self.response_format and self.response_format.type in (
+            "json_schema",
+            "json_object",
+            "structural_tag",
+        ):
+            logger.warning(
+                "Ignoring response_format.type=%s to bypass grammar constrained decoding.",
+                self.response_format.type,
             )
-        elif self.response_format and self.response_format.type == "json_object":
-            sampling_params["json_schema"] = '{"type": "object"}'
-        elif self.response_format and self.response_format.type == "structural_tag":
-            sampling_params["structural_tag"] = convert_json_schema_to_str(
-                self.response_format.model_dump(by_alias=True)
-            )
-
         # Check if there are already existing output constraints
         has_existing_constraints = (
             sampling_params.get("regex")
