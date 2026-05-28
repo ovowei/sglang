@@ -682,8 +682,11 @@ class ChatCompletionRequest(BaseModel):
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
+        elif values.get("tool_choice") == "auto":
+            pass
+        else:
+            values["tool_choice"] = "auto"
         return values
-
 
     @model_validator(mode="before")
     @classmethod

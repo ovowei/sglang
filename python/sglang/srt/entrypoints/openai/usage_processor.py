@@ -12,7 +12,7 @@ class UsageProcessor:
     @staticmethod
     def _details_if_cached(count: int) -> Optional[PromptTokensDetails]:
         """Return PromptTokensDetails only when count > 0 (keeps JSON slim)."""
-        return PromptTokensDetails(cached_tokens=count) if count > 0 else None
+        return PromptTokensDetails(cached_tokens=count) 
 
     @staticmethod
     def calculate_response_usage(

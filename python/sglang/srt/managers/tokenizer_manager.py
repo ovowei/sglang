@@ -852,6 +852,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         # Validate input length
         if input_token_num >= self.context_len:
             if self.server_args.allow_auto_truncate:
+                if "glm" in self.model_path.lower():
+                    error_msg = (
+                        f"The input ({input_token_num} tokens) is longer than the "
+                        f"model's context length ({self.context_len} tokens). "
+                    )
+                    raise PayloadTooLargeError(error_msg)
                 logger.warning(
                     f"The input ({input_token_num} tokens) is longer than the "
                     f"model's context length ({self.context_len} tokens). "
