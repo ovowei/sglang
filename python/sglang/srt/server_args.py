@@ -109,6 +109,7 @@ QUANTIZATION_CHOICES = [
     "modelopt_fp8",
     "modelopt_fp4",
     "modelopt_mixed",
+    "glm_mixed_moe",
     "petit_nvfp4",
     "w8a8_int8",
     "w8a8_fp8",
@@ -1651,7 +1652,7 @@ class ServerArgs:
                     and self.moe_runner_backend == "auto"
                     and (
                         self.quantization
-                        in ["fp8", "modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
+                        in ["fp8", "modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "glm_mixed_moe"]
                         or is_kimi_k2_k25_thinking_int4
                     )
                 ):
@@ -2694,8 +2695,9 @@ class ServerArgs:
                 "modelopt_fp4",
                 "modelopt_fp8",
                 "modelopt_mixed",
+                "glm_mixed_moe",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', 'glm_mixed_moe', or bfloat16 (None)."
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -2708,9 +2710,10 @@ class ServerArgs:
                 "mxfp8",
                 "modelopt_fp8",
                 "modelopt_mixed",
+                "glm_mixed_moe",
                 "compressed-tensors",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'glm_mixed_moe', 'kimi_mixed_moe', 'compressed-tensors', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."

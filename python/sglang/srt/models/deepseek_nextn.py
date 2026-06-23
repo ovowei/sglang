@@ -81,9 +81,13 @@ class DeepseekModelNextN(nn.Module):
         else:
             moe_quant_config_override = None
 
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+        if quant_config is not None and quant_config.get_name() in {
+            "modelopt_fp4",
+            "glm_mixed_moe",
+        }:
             logger.warning(
-                "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
+                "Overriding DeepseekV3ForCausalLMNextN quant config for %s Deepseek model.",
+                quant_config.get_name(),
             )
             quant_config = None
 

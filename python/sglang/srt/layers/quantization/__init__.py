@@ -29,6 +29,7 @@ from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
 from sglang.srt.layers.quantization.gguf import GGUFConfig
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
+    GLMMixedMoEQuantConfig,
     ModelOptFp4Config,
     ModelOptFp8Config,
     ModelOptMixedPrecisionConfig,
@@ -59,6 +60,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "modelopt_fp8": ModelOptFp8Config,
     "modelopt_fp4": ModelOptFp4Config,
     "modelopt_mixed": ModelOptMixedPrecisionConfig,
+    "glm_mixed_moe": GLMMixedMoEQuantConfig,
     "w8a8_int8": W8A8Int8Config,
     "w8a8_fp8": W8A8Fp8Config,
     "awq": AWQConfig,

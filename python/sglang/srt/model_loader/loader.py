@@ -3113,7 +3113,7 @@ def get_model_loader(
     if model_config and (
         (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
         or model_config.quantization
-        in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "modelopt"]
+        in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "glm_mixed_moe", "modelopt"]
     ):
         logger.info("Using ModelOptModelLoader due to ModelOpt quantization config.")
         return ModelOptModelLoader(load_config)
@@ -3123,7 +3123,7 @@ def get_model_loader(
         model_config
         and hasattr(model_config, "quantization")
         and model_config.quantization
-        in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
+        in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "glm_mixed_moe"]
     ):
         if model_config._is_already_quantized():
             logger.info(

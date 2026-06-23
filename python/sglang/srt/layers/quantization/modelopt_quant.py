@@ -34,6 +34,12 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.srt.layers.quantization.fp8 import (
+    Fp8Config,
+    Fp8KVCacheMethod,
+    Fp8LinearMethod,
+    Fp8MoEMethod,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
@@ -781,6 +787,155 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
 
         return None
 
+class GLMMixedMoEQuantConfig(ModelOptQuantConfig):
+    """GLM-5.1 mixed FP8/NVFP4 checkpoint config.
+
+    The GLM mixed checkpoint keeps the original GLM-5.1-FP8 format for
+    attention, dense layers, and skipped MoE layers. Only selected MoE experts
+    are stored as ModelOpt NVFP4. Keep this logic separate from generic
+    modelopt_mixed, which expects an explicit quantized_layers map.
+    """
+
+    _GLM_MIXED_ALGOS = {
+        "GLM_MIXED_MOE",
+        "GLM_MIXED_MOE_NVFP4_FP8",
+    }
+
+    def __init__(
+        self,
+        kv_cache_quant_algo: Optional[str],
+        exclude_modules: Optional[List[str]],
+        packed_modules_mapping: Optional[Dict[str, List[str]]],
+        fp8_config: Fp8Config,
+        nvfp4_config: "ModelOptFp4Config",
+    ) -> None:
+        super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
+        self.fp8_config = fp8_config
+        self.nvfp4_config = nvfp4_config
+
+    @classmethod
+    def override_quantization_method(cls, hf_quant_config, user_quant):
+        if hf_quant_config is None:
+            return None
+        quant_algo = str(hf_quant_config.get("quant_algo", "")).upper()
+        quant_method = str(hf_quant_config.get("quant_method", "")).lower()
+        if quant_method == cls.get_name() or quant_algo in cls._GLM_MIXED_ALGOS:
+            return cls.get_name()
+        if user_quant == cls.get_name() and quant_algo == "NVFP4" and quant_method in {
+            "modelopt",
+            "modelopt_fp4",
+        }:
+            return cls.get_name()
+        return None
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "glm_mixed_moe"
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+        return [torch.bfloat16, torch.half]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return ModelOptFp4Config.get_min_capability()
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "GLMMixedMoEQuantConfig":
+        quantization_section = config.get("quantization", config)
+        quant_algo = str(quantization_section.get("quant_algo", "")).upper()
+        quant_method = str(quantization_section.get("quant_method", "")).lower()
+        if (
+            quant_method != cls.get_name()
+            and quant_algo not in cls._GLM_MIXED_ALGOS
+            and quant_algo != "NVFP4"
+        ):
+            raise ValueError(
+                "GLMMixedMoEQuantConfig requires quant_method='glm_mixed_moe' "
+                "or a GLM mixed/NVFP4 ModelOpt checkpoint."
+            )
+
+        kv_cache_quant_algo = quantization_section.get("kv_cache_quant_algo")
+        exclude_modules = quantization_section.get("exclude_modules")
+        if exclude_modules is None:
+            exclude_modules = quantization_section.get("ignore")
+
+        packed_modules_mapping = dict(config.get("packed_modules_mapping") or {})
+        packed_modules_mapping.setdefault("gate_up_proj", ["gate_proj", "up_proj"])
+        packed_modules_mapping.setdefault(
+            "fused_qkv_a_proj_with_mqa", ["q_a_proj", "kv_a_proj_with_mqa"]
+        )
+
+        fp8_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme=quantization_section.get(
+                "fp8_activation_scheme", "dynamic"
+            ),
+            ignored_layers=[],
+            weight_block_size=quantization_section.get("fp8_weight_block_size")
+            or quantization_section.get("fallback_fp8_weight_block_size")
+            or quantization_section.get("weight_block_size")
+            or [128, 128],
+            packed_modules_mapping=packed_modules_mapping,
+        )
+        nvfp4_config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            kv_cache_quant_algo=kv_cache_quant_algo,
+            exclude_modules=[],
+            packed_modules_mapping=packed_modules_mapping,
+            group_size=int(quantization_section.get("group_size", 16)),
+        )
+
+        return cls(
+            kv_cache_quant_algo=kv_cache_quant_algo,
+            exclude_modules=exclude_modules,
+            packed_modules_mapping=packed_modules_mapping,
+            fp8_config=fp8_config,
+            nvfp4_config=nvfp4_config,
+        )
+
+    def _fp8_method(self, layer: torch.nn.Module) -> Optional[QuantizeMethodBase]:
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if isinstance(layer, LinearBase):
+            return Fp8LinearMethod(self.fp8_config)
+        if isinstance(layer, FusedMoE):
+            return Fp8MoEMethod(self.fp8_config)
+        return None
+
+    @staticmethod
+    def _is_plain_float_linear(prefix: str) -> bool:
+        return prefix == "lm_head" or prefix.endswith(".lm_head")
+
+    @staticmethod
+    def _is_shared_expert_prefix(prefix: str) -> bool:
+        return ".mlp.shared_experts." in f".{prefix}"
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[QuantizeMethodBase]:
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if isinstance(layer, LinearBase):
+            if self._is_plain_float_linear(prefix):
+                return UnquantizedLinearMethod()
+            if self._is_shared_expert_prefix(prefix) and not self.is_layer_excluded(
+                prefix
+            ):
+                return ModelOptFp4LinearMethod(self.nvfp4_config)
+            return self._fp8_method(layer)
+
+        if self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
+            return Fp8KVCacheMethod(self.fp8_config)
+
+        if isinstance(layer, FusedMoE):
+            if self.is_layer_excluded(prefix):
+                return self._fp8_method(layer)
+            return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
+
+        return None
 
 class ModelOptFp8MoEMethod(FusedMoEMethodBase):
     """MoE method for ModelOpt FP8.
